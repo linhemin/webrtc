@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) net: Arc<Net>,
     pub(crate) interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
+    pub(crate) gather_interface_srflx: bool,
     pub(crate) ext_ip_mapper: Arc<Option<ExternalIpMapper>>,
     pub(crate) agent_internal: Arc<AgentInternal>,
     pub(crate) gathering_state: Arc<AtomicU8>,
@@ -120,20 +121,43 @@ impl Agent {
                         UDPNetwork::Muxed(_) => continue,
                     };
 
-                    let srflx_params = GatherCandidatesSrflxParams {
+                    let srflx_params = Arc::new(GatherCandidatesSrflxParams {
                         urls: params.urls.clone(),
                         network_types: params.network_types.clone(),
                         port_max: ephemeral_config.port_max(),
                         port_min: ephemeral_config.port_min(),
                         net: Arc::clone(&params.net),
                         agent_internal: Arc::clone(&params.agent_internal),
-                    };
+                    });
+                    let wildcard = Arc::clone(&srflx_params);
                     let w1 = wg.worker();
                     tokio::spawn(async move {
                         let _d = w1;
-
-                        Self::gather_candidates_srflx(srflx_params).await;
+                        Self::gather_candidates_srflx(wildcard).await;
                     });
+
+                    // The related address of a bound srflx candidate is its local IP.
+                    // Only expose it if this session already permits advertising that host IP.
+                    if params.gather_interface_srflx
+                        && params.candidate_types.contains(&CandidateType::Host)
+                        && params.mdns_mode != MulticastDnsMode::QueryAndGather
+                        && params.ext_ip_mapper.is_none()
+                    {
+                        let interface_filter = Arc::clone(&params.interface_filter);
+                        let ip_filter = Arc::clone(&params.ip_filter);
+                        let include_loopback = params.include_loopback;
+                        let worker = wg.worker();
+                        tokio::spawn(async move {
+                            let _worker = worker;
+                            Self::gather_interface_srflx(
+                                srflx_params,
+                                interface_filter,
+                                ip_filter,
+                                include_loopback,
+                            )
+                            .await;
+                        });
+                    }
                     if let Some(ext_ip_mapper) = &*params.ext_ip_mapper {
                         if ext_ip_mapper.candidate_type == CandidateType::ServerReflexive {
                             let srflx_mapped_params = GatherCandidatesSrflxMappedParasm {
@@ -600,141 +624,188 @@ impl Agent {
         wg.wait().await;
     }
 
-    async fn gather_candidates_srflx(params: GatherCandidatesSrflxParams) {
-        let GatherCandidatesSrflxParams {
-            urls,
-            network_types,
-            port_max,
-            port_min,
-            net,
-            agent_internal,
-        } = params;
-
+    async fn gather_candidates_srflx(params: Arc<GatherCandidatesSrflxParams>) {
         let wg = WaitGroup::new();
-        for network_type in network_types {
-            if network_type.is_tcp() {
-                continue;
-            }
-
-            for url in &urls {
-                let network = network_type.to_string();
-                let is_ipv4 = network_type.is_ipv4();
+        for network in params.network_types.iter().filter(|n| n.is_udp()) {
+            let source = if network.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            };
+            for url in &params.urls {
+                let worker = wg.worker();
+                let params = Arc::clone(&params);
                 let url = url.clone();
-                let net2 = Arc::clone(&net);
-                let agent_internal2 = Arc::clone(&agent_internal);
-
-                let w = wg.worker();
                 tokio::spawn(async move {
-                    let _d = w;
-
-                    let host_port = format!("{}:{}", url.host, url.port);
-                    let server_addr = match net2.resolve_addr(is_ipv4, &host_port).await {
-                        Ok(addr) => addr,
-                        Err(err) => {
-                            log::warn!(
-                                "[{}]: failed to resolve stun host: {}: {}",
-                                agent_internal2.get_name(),
-                                host_port,
-                                err
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    let conn: Arc<dyn Conn + Send + Sync> = match listen_udp_in_port_range(
-                        &net2,
-                        port_max,
-                        port_min,
-                        if is_ipv4 {
-                            SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 0)
-                        } else {
-                            SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), 0)
-                        },
-                    )
-                    .await
-                    {
-                        Ok(conn) => conn,
-                        Err(err) => {
-                            log::warn!(
-                                "[{}]: Failed to listen for {}: {}",
-                                agent_internal2.get_name(),
-                                server_addr,
-                                err
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    let xoraddr =
-                        match get_xormapped_addr(&conn, server_addr, STUN_GATHER_TIMEOUT).await {
-                            Ok(xoraddr) => xoraddr,
-                            Err(err) => {
-                                log::warn!(
-                                    "[{}]: could not get server reflexive address {} {}: {}",
-                                    agent_internal2.get_name(),
-                                    network,
-                                    url,
-                                    err
-                                );
-                                return Ok(());
-                            }
-                        };
-
-                    let (ip, port) = (xoraddr.ip, xoraddr.port);
-
-                    let laddr = conn.local_addr()?;
-                    let srflx_config = CandidateServerReflexiveConfig {
-                        base_config: CandidateBaseConfig {
-                            network: network.clone(),
-                            address: ip.to_string(),
-                            port,
-                            component: COMPONENT_RTP,
-                            conn: Some(conn),
-                            ..CandidateBaseConfig::default()
-                        },
-                        rel_addr: laddr.ip().to_string(),
-                        rel_port: laddr.port(),
-                    };
-
-                    let candidate: Arc<dyn Candidate + Send + Sync> =
-                        match srflx_config.new_candidate_server_reflexive() {
-                            Ok(candidate) => Arc::new(candidate),
-                            Err(err) => {
-                                log::warn!(
-                                "[{}]: Failed to create server reflexive candidate: {} {} {}: {:?}",
-                                agent_internal2.get_name(),
-                                network,
-                                ip,
-                                port,
-                                err
-                            );
-                                return Ok(());
-                            }
-                        };
-
-                    {
-                        if let Err(err) = agent_internal2.add_candidate(&candidate).await {
-                            if let Err(close_err) = candidate.close().await {
-                                log::warn!(
-                                    "[{}]: Failed to close candidate: {}",
-                                    agent_internal2.get_name(),
-                                    close_err
-                                );
-                            }
-                            log::warn!(
-                                "[{}]: Failed to append to localCandidates and run onCandidateHdlr: {}",
-                                agent_internal2.get_name(),
-                                err
-                            );
-                        }
+                    let _worker = worker;
+                    if let Err(err) = Self::gather_srflx_from(&params, source, &url, None).await {
+                        log::warn!(
+                            "[{}]: failed to gather server reflexive candidate: {}",
+                            params.agent_internal.get_name(),
+                            err
+                        );
                     }
-
-                    Result::<()>::Ok(())
                 });
             }
         }
-
         wg.wait().await;
+    }
+
+    async fn gather_interface_srflx(
+        params: Arc<GatherCandidatesSrflxParams>,
+        interface_filter: Arc<Option<InterfaceFilterFn>>,
+        ip_filter: Arc<Option<IpFilterFn>>,
+        include_loopback: bool,
+    ) {
+        const MAX_SOURCES_PER_FAMILY: usize = 4;
+        const MAX_STUN_SERVERS: usize = 2;
+        let mut urls: Vec<Url> = Vec::new();
+        for url in &params.urls {
+            if url.scheme == SchemeType::Stun
+                && url.proto == ProtoType::Udp
+                && !urls
+                    .iter()
+                    .any(|v| v.host.eq_ignore_ascii_case(&url.host) && v.port == url.port)
+            {
+                urls.push(url.clone());
+                if urls.len() == MAX_STUN_SERVERS {
+                    break;
+                }
+            }
+        }
+        if urls.is_empty() {
+            return;
+        }
+        let udp_types: Vec<_> = params
+            .network_types
+            .iter()
+            .copied()
+            .filter(|n| n.is_udp())
+            .collect();
+        let deadline = Instant::now() + STUN_GATHER_TIMEOUT;
+        let gather_sources = local_interfaces(
+            &params.net,
+            &interface_filter,
+            &ip_filter,
+            &udp_types,
+            include_loopback,
+        );
+        let Ok(sources) = tokio::time::timeout_at(deadline, gather_sources).await else {
+            return;
+        };
+        // HashSet iteration also lets later ICE attempts sample different local addresses
+        // on hosts with more candidates than the per-family socket budget.
+        let urls = Arc::new(urls);
+        let wg = WaitGroup::new();
+        for v4 in [true, false] {
+            for &source in sources
+                .iter()
+                .filter(|s| !s.is_unspecified() && s.is_ipv4() == v4)
+                .take(MAX_SOURCES_PER_FAMILY)
+            {
+                let worker = wg.worker();
+                let params = Arc::clone(&params);
+                let urls = Arc::clone(&urls);
+                tokio::spawn(async move {
+                    let _worker = worker;
+                    for (index, url) in urls.iter().enumerate() {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let slice = (deadline - now) / (urls.len() - index) as u32;
+                        if Self::gather_srflx_from(&params, source, url, Some(now + slice))
+                            .await
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+        wg.wait().await;
+    }
+
+    async fn gather_srflx_from(
+        params: &GatherCandidatesSrflxParams,
+        source: IpAddr,
+        url: &Url,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        async fn before<T, E: Into<Error>>(
+            deadline: Option<Instant>,
+            operation: impl Future<Output = std::result::Result<T, E>>,
+        ) -> Result<T> {
+            let result = if let Some(end) = deadline {
+                tokio::time::timeout_at(end, operation)
+                    .await
+                    .map_err(|_| Error::ErrGetXorMappedAddrResponse)?
+            } else {
+                operation.await
+            };
+            result.map_err(Into::into)
+        }
+        let host_port = match url.host.parse::<Ipv6Addr>() {
+            Ok(ip) => SocketAddr::new(IpAddr::V6(ip), url.port).to_string(),
+            Err(_) => format!("{}:{}", url.host, url.port),
+        };
+        let remote = before(
+            deadline,
+            params.net.resolve_addr(source.is_ipv4(), &host_port),
+        )
+        .await?;
+        let conn = before(
+            deadline,
+            listen_udp_in_port_range(
+                &params.net,
+                params.port_max,
+                params.port_min,
+                SocketAddr::new(source, 0),
+            ),
+        )
+        .await?;
+        let built = async {
+            let mapped = before(
+                deadline,
+                get_xormapped_addr(&conn, remote, STUN_GATHER_TIMEOUT),
+            )
+            .await?;
+            let local = conn.local_addr()?;
+            let config = CandidateServerReflexiveConfig {
+                base_config: CandidateBaseConfig {
+                    network: if source.is_ipv4() {
+                        NetworkType::Udp4
+                    } else {
+                        NetworkType::Udp6
+                    }
+                    .to_string(),
+                    address: mapped.ip.to_string(),
+                    port: mapped.port,
+                    component: COMPONENT_RTP,
+                    conn: Some(Arc::clone(&conn)),
+                    ..Default::default()
+                },
+                rel_addr: local.ip().to_string(),
+                rel_port: local.port(),
+            };
+            config.new_candidate_server_reflexive()
+        }
+        .await;
+        // VNet keeps its own socket-map reference; dropping a failed STUN socket alone
+        // doesn't release the port there. A registered candidate instead owns this socket.
+        let candidate: Arc<dyn Candidate + Send + Sync> = match built {
+            Ok(candidate) => Arc::new(candidate),
+            Err(err) => {
+                let _ = conn.close().await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = params.agent_internal.add_candidate(&candidate).await {
+            let _ = candidate.close().await;
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub(crate) async fn gather_candidates_relay(

@@ -149,6 +149,9 @@ pub struct AgentConfig {
     /// the ips which are used to gather ICE candidates.
     pub ip_filter: Arc<Option<IpFilterFn>>,
 
+    /// Also obtain a bounded set of STUN mappings from eligible local host addresses.
+    pub gather_interface_srflx: bool,
+
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
     /// DTLS.
     pub insecure_skip_verify: bool,

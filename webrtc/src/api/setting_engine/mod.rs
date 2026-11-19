@@ -46,6 +46,7 @@ pub struct Candidates {
     pub ice_network_types: Vec<NetworkType>,
     pub interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub ip_filter: Arc<Option<IpFilterFn>>,
+    pub gather_interface_srflx: bool,
     pub nat_1to1_ips: Vec<String>,
     pub nat_1to1_ip_candidate_type: RTCIceCandidateType,
     pub multicast_dns_mode: MulticastDnsMode,
@@ -190,6 +191,11 @@ impl SettingEngine {
     /// the amount of information you wish to expose to the remote peer
     pub fn set_interface_filter(&mut self, filter: InterfaceFilterFn) {
         self.candidates.interface_filter = Arc::new(Some(filter));
+    }
+
+    /// Also gather bounded, source-specific UDP STUN mappings using the host-candidate filters.
+    pub fn set_ice_gather_interface_srflx(&mut self, enabled: bool) {
+        self.candidates.gather_interface_srflx = enabled;
     }
 
     /// set_ip_filter sets the filtering functions when gathering ICE candidates

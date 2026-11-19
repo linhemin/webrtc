@@ -513,3 +513,128 @@ async fn test_vnet_gather_muxed_udp() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_source_specific_srflx_reuses_filtered_interfaces() -> Result<()> {
+    use stun::message::{Message, BINDING_SUCCESS};
+    use stun::xoraddr::XorMappedAddress;
+    use tokio::time::timeout;
+
+    let addr = std::net::Ipv4Addr::LOCALHOST;
+    let stun = UdpSocket::bind((addr, 0)).await?;
+    let url = Url::parse_url(&format!("stun:{}", stun.local_addr()?))?;
+    let server = tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        while let Ok((n, peer)) = stun.recv_from(&mut buffer).await {
+            let mut request = Message::new();
+            request.raw = buffer[..n].to_vec();
+            request.decode().unwrap();
+            let mut reply = Message::new();
+            reply
+                .build(&[
+                    Box::new(BINDING_SUCCESS),
+                    Box::new(request.transaction_id),
+                    Box::new(XorMappedAddress {
+                        ip: peer.ip(),
+                        port: peer.port(),
+                    }),
+                ])
+                .unwrap();
+            stun.send_to(&reply.raw, peer).await.unwrap();
+        }
+    });
+
+    // With the same real UDP STUN server wildcard gathering must work in every case.
+    // A second mapping must have a new port and the bound source as related address;
+    // a blocked interface, disabled host candidate, or opt-out keeps that IP private.
+    for (enable, allow_ip, allow_interface, allow_host, expect_bound) in [
+        (true, true, true, true, true),
+        (false, true, true, true, false),
+        (true, false, true, true, false),
+        (true, true, false, true, false),
+        (true, true, true, false, false),
+    ] {
+        let mut types = vec![CandidateType::ServerReflexive];
+        if allow_host {
+            types.push(CandidateType::Host);
+        }
+        let a = Agent::new(AgentConfig {
+            gather_interface_srflx: enable,
+            interface_filter: Arc::new(Some(Box::new(move |_| allow_interface))),
+            urls: vec![url.clone()],
+            network_types: vec![NetworkType::Udp4],
+            candidate_types: types,
+            multicast_dns_mode: MulticastDnsMode::Disabled,
+            include_loopback: true,
+            ip_filter: Arc::new(Some(Box::new(move |ip| {
+                allow_ip && ip == std::net::IpAddr::V4(addr)
+            }))),
+            ..Default::default()
+        })
+        .await?;
+        let (tx, mut rx) = mpsc::channel(1);
+        a.on_candidate(Box::new(move |c| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if c.is_none() {
+                    let _ = tx.send(()).await;
+                }
+            })
+        }));
+        a.gather_candidates()?;
+        timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let all = a.get_local_candidates().await?;
+        let mut mapped: Vec<_> = all
+            .iter()
+            .filter(|c| c.candidate_type() == CandidateType::ServerReflexive)
+            .map(|c| (c.related_address().unwrap().address, c.port()))
+            .collect();
+        mapped.sort_unstable();
+        assert_eq!(mapped.len(), if expect_bound { 2 } else { 1 });
+        assert_eq!(mapped[0].0, "0.0.0.0");
+        if expect_bound {
+            assert_eq!(mapped[1].0, "127.0.0.1");
+            assert_ne!(mapped[0].1, mapped[1].1);
+        }
+        a.close().await?;
+    }
+    // The first configured STUN listener stays silent. The second must yield a bound
+    // mapping before the original five-second wildcard gathering deadline.
+    let silent = UdpSocket::bind((addr, 0)).await?;
+    let first = Url::parse_url(&format!("stun:{}", silent.local_addr()?))?;
+    let a = Agent::new(AgentConfig {
+        gather_interface_srflx: true,
+        urls: vec![first, url],
+        network_types: vec![NetworkType::Udp4],
+        candidate_types: vec![CandidateType::Host, CandidateType::ServerReflexive],
+        multicast_dns_mode: MulticastDnsMode::Disabled,
+        include_loopback: true,
+        ip_filter: Arc::new(Some(Box::new(move |ip| ip == std::net::IpAddr::V4(addr)))),
+        ..Default::default()
+    })
+    .await?;
+    let (tx, mut rx) = mpsc::channel(1);
+    a.on_candidate(Box::new(move |c| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            if let Some(c) = c {
+                if c.candidate_type() == CandidateType::ServerReflexive
+                    && c.related_address().map(|a| a.address) == Some("127.0.0.1".into())
+                {
+                    let _ = tx.send(()).await;
+                }
+            }
+        })
+    }));
+    a.gather_candidates()?;
+    timeout(Duration::from_secs(4), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    a.close().await?;
+    server.abort();
+    Ok(())
+}
