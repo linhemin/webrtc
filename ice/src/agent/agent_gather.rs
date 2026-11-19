@@ -24,6 +24,10 @@ const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 #[path = "nat64_gather_test.rs"]
 mod nat64_gather_test;
 
+#[cfg(test)]
+#[path = "interface_stun_test.rs"]
+mod interface_stun_test;
+
 pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) udp_network: UDPNetwork,
     pub(crate) candidate_types: Vec<CandidateType>,
@@ -35,6 +39,7 @@ pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
+    pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub(crate) ext_ip_mapper: Arc<Option<ExternalIpMapper>>,
     pub(crate) agent_internal: Arc<AgentInternal>,
     pub(crate) gathering_state: Arc<AtomicU8>,
@@ -76,6 +81,7 @@ struct GatherCandidatesSrflxMappedParasm {
 }
 
 struct GatherCandidatesSrflxParams {
+    interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     urls: Vec<Url>,
     network_types: Vec<NetworkType>,
     port_max: u16,
@@ -164,6 +170,7 @@ impl Agent {
                     };
 
                     let srflx_params = Arc::new(GatherCandidatesSrflxParams {
+                        interface_stun_provider: params.interface_stun_provider.clone(),
                         urls: params.urls.clone(),
                         network_types: params.network_types.clone(),
                         port_max: ephemeral_config.port_max(),
@@ -714,6 +721,11 @@ impl Agent {
     ) {
         const MAX_SOURCES_PER_FAMILY: usize = 4;
         const MAX_STUN_SERVERS: usize = 2;
+        let server_limit = if params.interface_stun_provider.is_some() {
+            4
+        } else {
+            MAX_STUN_SERVERS
+        };
         let mut urls: Vec<Url> = Vec::new();
         for url in &params.urls {
             if url.scheme == SchemeType::Stun
@@ -723,7 +735,7 @@ impl Agent {
                     .any(|v| v.host.eq_ignore_ascii_case(&url.host) && v.port == url.port)
             {
                 urls.push(url.clone());
-                if urls.len() == MAX_STUN_SERVERS {
+                if urls.len() == server_limit {
                     break;
                 }
             }
@@ -752,34 +764,123 @@ impl Agent {
         // on hosts with more candidates than the per-family socket budget.
         let urls = Arc::new(urls);
         let wg = WaitGroup::new();
+        let mut paths = Vec::new();
         for v4 in [true, false] {
             for &source in sources
                 .iter()
                 .filter(|s| !s.is_unspecified() && s.is_ipv4() == v4)
                 .take(MAX_SOURCES_PER_FAMILY)
             {
-                let worker = wg.worker();
-                let params = Arc::clone(&params);
-                let urls = Arc::clone(&urls);
-                tokio::spawn(async move {
-                    let _worker = worker;
-                    for (index, url) in urls.iter().enumerate() {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        let slice = (deadline - now) / (urls.len() - index) as u32;
-                        if Self::gather_srflx_from(&params, source, url, Some(now + slice))
-                            .await
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                });
+                paths.push((source, None));
             }
         }
+        if let Some(provider) = &params.interface_stun_provider {
+            // Filter before taking the per-family budget: virtual adapters should not crowd
+            // the eligible physical sources out of this independent path.
+            paths.extend(
+                sources
+                    .iter()
+                    .filter_map(|source| match source {
+                        IpAddr::V4(v4) if !v4.is_unspecified() && provider.supports_source(*v4) => {
+                            Some((*source, Some((provider.clone(), *v4))))
+                        }
+                        _ => None,
+                    })
+                    .take(MAX_SOURCES_PER_FAMILY),
+            );
+        }
+        for (source, physical) in paths {
+            let worker = wg.worker();
+            let params = params.clone();
+            let urls = urls.clone();
+            tokio::spawn(async move {
+                let _worker = worker;
+                let urls = if physical.is_some() {
+                    &urls[..]
+                } else {
+                    &urls[..urls.len().min(MAX_STUN_SERVERS)]
+                };
+                for (index, url) in urls.iter().enumerate() {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let end = now + (deadline - now) / (urls.len() - index) as u32;
+                    let attempt = match &physical {
+                        Some((provider, v4)) => {
+                            Self::gather_provider_srflx(&params, provider.as_ref(), *v4, url, end)
+                                .await
+                        }
+                        None => Self::gather_srflx_from(&params, source, url, Some(end)).await,
+                    };
+                    if attempt.is_ok() {
+                        break;
+                    }
+                }
+            });
+        }
         wg.wait().await;
+    }
+
+    async fn gather_provider_srflx(
+        params: &GatherCandidatesSrflxParams,
+        provider: &dyn InterfaceStunProvider,
+        source: Ipv4Addr,
+        url: &Url,
+        deadline: Instant,
+    ) -> Result<()> {
+        let Some((conn, remote)) = tokio::time::timeout_at(
+            deadline,
+            provider.bind_and_resolve(
+                source,
+                &url.host,
+                url.port,
+                params.port_min,
+                params.port_max,
+            ),
+        )
+        .await
+        .map_err(|_| Error::ErrGetXorMappedAddrResponse)?
+        else {
+            return Err(Error::ErrGetXorMappedAddrResponse);
+        };
+        let allowed_source = conn.local_addr().is_ok_and(|local| {
+            local.ip() == IpAddr::V4(source)
+                && local.port() > 0
+                && (params.port_min == 0 || local.port() >= params.port_min)
+                && (params.port_max == 0 || local.port() <= params.port_max)
+        });
+        if !allowed_source
+            || conn.remote_addr().is_some()
+            || remote.port() != url.port
+            || remote.ip().is_unspecified()
+            || remote.ip().is_multicast()
+            || remote.ip().is_broadcast()
+        {
+            let _ = conn.close().await;
+            return Err(Error::ErrGetXorMappedAddrResponse);
+        }
+        Self::gather_srflx_on_socket(
+            params,
+            conn.clone(),
+            remote.into(),
+            &url.host,
+            Some(deadline),
+            true,
+        )
+        .await?;
+        // Adding a duplicate also returns Ok. Report only a published candidate that owns
+        // this exact verified socket, so the service log can distinguish gathering from use.
+        let locals = params.agent_internal.local_candidates.lock().await;
+        if locals.get(&NetworkType::Udp4).is_some_and(|candidates| {
+            candidates.iter().any(|c| {
+                c.get_conn()
+                    .is_some_and(|socket| Arc::ptr_eq(socket, &conn))
+            })
+        }) {
+            log::info!("Published interface-bound IPv4 STUN candidate");
+        }
+        Ok(())
     }
 
     async fn gather_srflx_from(
@@ -866,9 +967,9 @@ impl Agent {
         params: &GatherCandidatesSrflxParams,
         source: IpAddr,
         remote: SocketAddr,
-        _host: &str,
+        host: &str,
         deadline: Option<Instant>,
-        _require_translated_v4: bool,
+        require_mapped_v4: bool,
     ) -> Result<Option<IpAddr>> {
         let conn = before(
             deadline,
@@ -880,48 +981,51 @@ impl Agent {
             ),
         )
         .await?;
+        Self::gather_srflx_on_socket(params, conn, remote, host, deadline, require_mapped_v4).await
+    }
+
+    async fn gather_srflx_on_socket(
+        params: &GatherCandidatesSrflxParams,
+        conn: Arc<dyn Conn + Send + Sync>,
+        remote: SocketAddr,
+        _host: &str,
+        deadline: Option<Instant>,
+        require_mapped_v4: bool,
+    ) -> Result<Option<IpAddr>> {
         let built = async {
-            #[cfg(not(any(target_os = "ios", test)))]
-            let mapped = before(
+            let (mapped, matched) = before(
                 deadline,
-                get_xormapped_addr(&conn, remote, STUN_GATHER_TIMEOUT),
+                observed_mapping(&conn, remote, STUN_GATHER_TIMEOUT),
             )
             .await?;
+            let valid = matched
+                && mapped.port > 0
+                && !mapped.ip.is_unspecified()
+                && !mapped.ip.is_multicast();
+            if require_mapped_v4
+                && (!valid || !matches!(mapped.ip, IpAddr::V4(ip) if !ip.is_broadcast()))
+            {
+                return Err(Error::ErrGetXorMappedAddrResponse);
+            }
             #[cfg(any(target_os = "ios", test))]
-            let (mapped, candidate_conn, observed) = {
-                let (mapped, matched) = before(
-                    deadline,
-                    observed_mapping(&conn, remote, STUN_GATHER_TIMEOUT),
-                )
-                .await?;
-                if _require_translated_v4 && (!matched || !mapped.ip.is_ipv4()) {
-                    return Err(Error::ErrGetXorMappedAddrResponse);
-                }
-                let candidate_conn = before(
-                    deadline,
-                    crate::nat64::candidate_socket(
-                        &conn,
-                        remote,
-                        &mapped,
-                        matched,
-                        _host,
-                        &params.dns64,
-                    ),
-                )
-                .await?;
-                let observed = (matched
-                    && mapped.port != 0
-                    && !mapped.ip.is_unspecified()
-                    && !mapped.ip.is_multicast())
-                .then_some(mapped.ip);
-                (mapped, candidate_conn, observed)
-            };
+            let candidate_conn = before(
+                deadline,
+                crate::nat64::candidate_socket(
+                    &conn,
+                    remote,
+                    &mapped,
+                    matched,
+                    _host,
+                    &params.dns64,
+                ),
+            )
+            .await?;
             #[cfg(not(any(target_os = "ios", test)))]
-            let (candidate_conn, observed) = (Arc::clone(&conn), None);
+            let candidate_conn = Arc::clone(&conn);
             let local = conn.local_addr()?;
             let config = CandidateServerReflexiveConfig {
                 base_config: CandidateBaseConfig {
-                    network: if source.is_ipv4() {
+                    network: if local.is_ipv4() {
                         NetworkType::Udp4
                     } else {
                         NetworkType::Udp6
@@ -936,7 +1040,10 @@ impl Agent {
                 rel_addr: local.ip().to_string(),
                 rel_port: local.port(),
             };
-            Ok((config.new_candidate_server_reflexive()?, observed))
+            Ok((
+                config.new_candidate_server_reflexive()?,
+                valid.then_some(mapped.ip),
+            ))
         }
         .await;
         // VNet keeps its own socket-map reference; dropping a failed STUN socket alone

@@ -54,6 +54,24 @@ pub(crate) fn default_candidate_types() -> Vec<CandidateType> {
 pub type InterfaceFilterFn = Box<dyn (Fn(&str) -> bool) + Send + Sync>;
 pub type IpFilterFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 
+/// Adds an independently routed IPv4 candidate on an already permitted local interface.
+/// Only configured UDP STUN servers are supplied. The provider must return an unconnected
+/// socket bound to the requested source/interface and resolve the name on that interface.
+/// Return `None` to decline a source or destination. Ordinary ICE gathering continues.
+#[async_trait::async_trait]
+pub trait InterfaceStunProvider: Send + Sync {
+    fn supports_source(&self, source: Ipv4Addr) -> bool;
+
+    async fn bind_and_resolve(
+        &self,
+        source: Ipv4Addr,
+        host: &str,
+        server_port: u16,
+        local_port_min: u16,
+        local_port_max: u16,
+    ) -> Option<(Arc<dyn util::Conn + Send + Sync>, std::net::SocketAddrV4)>;
+}
+
 /// Collects the arguments to `ice::Agent` construction into a single structure, for
 /// future-proofness of the interface.
 #[derive(Default)]
@@ -151,6 +169,7 @@ pub struct AgentConfig {
 
     /// Also obtain a bounded set of STUN mappings from eligible local host addresses.
     pub gather_interface_srflx: bool,
+    pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
 
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
     /// DTLS.

@@ -66,7 +66,6 @@ pub async fn get_xormapped_addr(
 
 /// Preserve the existing gathering result. A cross-family socket adapter additionally needs
 /// proof that this particular request was answered by its configured STUN endpoint.
-#[cfg(any(target_os = "ios", test))]
 pub(crate) async fn observed_mapping(
     conn: &Arc<dyn Conn + Send + Sync>,
     server_addr: SocketAddr,

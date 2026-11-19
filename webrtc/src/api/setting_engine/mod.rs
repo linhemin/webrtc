@@ -4,7 +4,7 @@ mod setting_engine_test;
 use std::sync::Arc;
 
 use dtls::extension::extension_use_srtp::SrtpProtectionProfile;
-use ice::agent::agent_config::{InterfaceFilterFn, IpFilterFn};
+use ice::agent::agent_config::{InterfaceFilterFn, InterfaceStunProvider, IpFilterFn};
 use ice::mdns::MulticastDnsMode;
 use ice::network_type::NetworkType;
 use ice::udp_network::UDPNetwork;
@@ -47,6 +47,7 @@ pub struct Candidates {
     pub interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub ip_filter: Arc<Option<IpFilterFn>>,
     pub gather_interface_srflx: bool,
+    pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub nat_1to1_ips: Vec<String>,
     pub nat_1to1_ip_candidate_type: RTCIceCandidateType,
     pub multicast_dns_mode: MulticastDnsMode,
@@ -196,6 +197,11 @@ impl SettingEngine {
     /// Also gather bounded, source-specific UDP STUN mappings using the host-candidate filters.
     pub fn set_ice_gather_interface_srflx(&mut self, enabled: bool) {
         self.candidates.gather_interface_srflx = enabled;
+    }
+
+    /// Adds per-interface STUN candidates when interface srflx and host gathering are allowed.
+    pub fn set_ice_interface_stun_provider(&mut self, provider: Arc<dyn InterfaceStunProvider>) {
+        self.candidates.interface_stun_provider = Some(provider);
     }
 
     /// set_ip_filter sets the filtering functions when gathering ICE candidates

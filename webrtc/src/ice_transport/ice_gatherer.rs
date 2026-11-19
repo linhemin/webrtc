@@ -128,6 +128,11 @@ impl RTCIceGatherer {
             interface_filter: self.setting_engine.candidates.interface_filter.clone(),
             ip_filter: self.setting_engine.candidates.ip_filter.clone(),
             gather_interface_srflx: self.setting_engine.candidates.gather_interface_srflx,
+            interface_stun_provider: self
+                .setting_engine
+                .candidates
+                .interface_stun_provider
+                .clone(),
             nat_1to1_ips: self.setting_engine.candidates.nat_1to1_ips.clone(),
             nat_1to1_ip_candidate_type: nat_1to1_cand_type,
             include_loopback: self.setting_engine.candidates.include_loopback_candidate,

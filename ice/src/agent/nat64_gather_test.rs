@@ -68,6 +68,7 @@ async fn dual_stack_stun_keeps_native_aaaa_and_adds_verified_translated_a() -> R
     })
     .await?;
     let params = Arc::new(GatherCandidatesSrflxParams {
+        interface_stun_provider: None,
         urls: vec![url.clone()],
         network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
         port_min: 49152,
