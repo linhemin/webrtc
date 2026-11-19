@@ -23,6 +23,16 @@ impl fmt::Display for RTCIceCandidatePair {
 }
 
 impl RTCIceCandidatePair {
+    /// The local ICE candidate used by this pair.
+    pub fn local(&self) -> &RTCIceCandidate {
+        &self.local
+    }
+
+    /// The peer's ICE candidate used by this pair.
+    pub fn remote(&self) -> &RTCIceCandidate {
+        &self.remote
+    }
+
     fn stats_id(local_id: &str, remote_id: &str) -> String {
         format!("{local_id}-{remote_id}")
     }
