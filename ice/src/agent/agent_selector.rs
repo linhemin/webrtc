@@ -142,6 +142,14 @@ impl AgentInternal {
             if nominated.is_some() || self.agent_conn.get_selected_pair().is_some() {
                 return true;
             }
+            let rtt = *pair.check_rtt.lock();
+            log::debug!(
+                "Nominating ICE pair local={} remote={} last_rtt_ms={:?} responses={}",
+                pair.local.candidate_type(),
+                pair.remote.candidate_type(),
+                (rtt.samples > 0).then_some(rtt.latest.as_secs_f64() * 1000.0),
+                rtt.samples,
+            );
             pair.nominated.store(true, Ordering::SeqCst);
             *nominated = Some(pair);
         }

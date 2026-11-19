@@ -85,9 +85,27 @@ async fn test_remote_local_addr() -> Result<()> {
         let a_laddr = ca.local_addr()?;
         let b_laddr = cb.local_addr()?;
 
-        // Assert addresses
-        assert_eq!(a_laddr.ip().to_string(), VNET_LOCAL_IPA.to_string());
-        assert_eq!(b_laddr.ip().to_string(), VNET_LOCAL_IPB.to_string());
+        // The selected local candidate can advertise the host or the 1:1 mapping.
+        // Both agents must see the peer's mapped address with the same port.
+        for (local, peer_view, host, mapped) in [
+            (
+                a_laddr,
+                cb.remote_addr().unwrap(),
+                VNET_LOCAL_IPA,
+                VNET_GLOBAL_IPA,
+            ),
+            (
+                b_laddr,
+                ca.remote_addr().unwrap(),
+                VNET_LOCAL_IPB,
+                VNET_GLOBAL_IPB,
+            ),
+        ] {
+            let local_ip = local.ip().to_string();
+            assert!(local_ip == host || local_ip == mapped);
+            assert_eq!(peer_view.ip().to_string(), mapped);
+            assert_eq!(peer_view.port(), local.port());
+        }
 
         // Close
         //ca.close().await?;
