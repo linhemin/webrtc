@@ -20,6 +20,10 @@ use crate::util::*;
 
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+#[path = "nat64_gather_test.rs"]
+mod nat64_gather_test;
+
 pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) udp_network: UDPNetwork,
     pub(crate) candidate_types: Vec<CandidateType>,
@@ -78,6 +82,44 @@ struct GatherCandidatesSrflxParams {
     port_min: u16,
     net: Arc<Net>,
     agent_internal: Arc<AgentInternal>,
+    #[cfg(any(target_os = "ios", test))]
+    dns64: crate::nat64::Discovery,
+    #[cfg(any(target_os = "ios", test))]
+    supplement: Option<Nat64Gather>,
+}
+
+#[cfg(any(target_os = "ios", test))]
+struct Nat64Gather {
+    start: Instant,
+    allow_wildcard: bool,
+    started: std::sync::atomic::AtomicBool,
+    have_v4: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(any(target_os = "ios", test))]
+impl Nat64Gather {
+    fn new(allow_wildcard: bool) -> Self {
+        Self {
+            start: Instant::now(),
+            allow_wildcard,
+            started: false.into(),
+            have_v4: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+async fn before<T, E: Into<Error>>(
+    deadline: Option<Instant>,
+    operation: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    let result = if let Some(end) = deadline {
+        tokio::time::timeout_at(end, operation)
+            .await
+            .map_err(|_| Error::ErrGetXorMappedAddrResponse)?
+    } else {
+        operation.await
+    };
+    result.map_err(Into::into)
 }
 
 impl Agent {
@@ -128,6 +170,19 @@ impl Agent {
                         port_min: ephemeral_config.port_min(),
                         net: Arc::clone(&params.net),
                         agent_internal: Arc::clone(&params.agent_internal),
+                        #[cfg(any(target_os = "ios", test))]
+                        dns64: Default::default(),
+                        #[cfg(any(target_os = "ios", test))]
+                        supplement: (params.network_types.contains(&NetworkType::Udp6)
+                            && params.network_types.contains(&NetworkType::Udp4)
+                            && params.candidate_types.contains(&CandidateType::Host)
+                            && params.ext_ip_mapper.is_none()
+                            && params.mdns_mode != MulticastDnsMode::QueryAndGather)
+                            .then(|| {
+                                Nat64Gather::new(
+                                    params.interface_filter.is_none() && params.ip_filter.is_none(),
+                                )
+                            }),
                     });
                     let wildcard = Arc::clone(&srflx_params);
                     let w1 = wg.worker();
@@ -733,19 +788,6 @@ impl Agent {
         url: &Url,
         deadline: Option<Instant>,
     ) -> Result<()> {
-        async fn before<T, E: Into<Error>>(
-            deadline: Option<Instant>,
-            operation: impl Future<Output = std::result::Result<T, E>>,
-        ) -> Result<T> {
-            let result = if let Some(end) = deadline {
-                tokio::time::timeout_at(end, operation)
-                    .await
-                    .map_err(|_| Error::ErrGetXorMappedAddrResponse)?
-            } else {
-                operation.await
-            };
-            result.map_err(Into::into)
-        }
         let host_port = match url.host.parse::<Ipv6Addr>() {
             Ok(ip) => SocketAddr::new(IpAddr::V6(ip), url.port).to_string(),
             Err(_) => format!("{}:{}", url.host, url.port),
@@ -755,6 +797,79 @@ impl Agent {
             params.net.resolve_addr(source.is_ipv4(), &host_port),
         )
         .await?;
+        let _observed =
+            Self::gather_srflx_at(params, source, remote, &url.host, deadline, false).await?;
+        #[cfg(any(target_os = "ios", test))]
+        if let (Some(observed), Some(extra)) = (_observed, params.supplement.as_ref()) {
+            if matches!(observed, IpAddr::V4(ip) if crate::nat64::globally_reachable_ipv4(ip)) {
+                extra.have_v4.send_replace(true);
+            } else if observed.is_ipv6()
+                && source.is_ipv6()
+                && remote.is_ipv6()
+                && url.scheme == SchemeType::Stun
+                && url.proto == ProtoType::Udp
+                && (!source.is_unspecified() || extra.allow_wildcard)
+            {
+                Self::try_nat64_stun(params, extra, source, &host_port).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    async fn try_nat64_stun(
+        params: &GatherCandidatesSrflxParams,
+        extra: &Nat64Gather,
+        source: IpAddr,
+        host_port: &str,
+    ) {
+        let mut have_v4 = extra.have_v4.subscribe();
+        let deadline = extra.start + STUN_GATHER_TIMEOUT;
+        if *have_v4.borrow()
+            || Instant::now() >= deadline
+            || extra.started.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        // Native IPv4 often arrives just after IPv6. It needs no translated duplicate.
+        tokio::select! {
+            _ = have_v4.wait_for(|seen| *seen) => return,
+            _ = tokio::time::sleep_until(extra.start + Duration::from_millis(350)) => {}
+        }
+        // Many STUN names have a native AAAA: a DNS64 resolver normally leaves it alone.
+        // Probe that SAME configured STUN server's A through a discovered prefix on a
+        // separate v6 socket. The native candidate has already been published.
+        let resolve = async {
+            let SocketAddr::V4(stun) = params.net.resolve_addr(true, host_port).await.ok()? else {
+                return None;
+            };
+            let translated = params
+                .dns64
+                .stun_destinations(stun)
+                .await
+                .into_iter()
+                .next()?;
+            Some((translated, stun.ip().to_string()))
+        };
+        let plan = tokio::select! {
+            _ = have_v4.wait_for(|seen| *seen) => return,
+            result = tokio::time::timeout_at(deadline, resolve) => result,
+        };
+        if let Ok(Some((translated, identity))) = plan {
+            let _ =
+                Self::gather_srflx_at(params, source, translated, &identity, Some(deadline), true)
+                    .await;
+        }
+    }
+
+    async fn gather_srflx_at(
+        params: &GatherCandidatesSrflxParams,
+        source: IpAddr,
+        remote: SocketAddr,
+        _host: &str,
+        deadline: Option<Instant>,
+        _require_translated_v4: bool,
+    ) -> Result<Option<IpAddr>> {
         let conn = before(
             deadline,
             listen_udp_in_port_range(
@@ -766,11 +881,43 @@ impl Agent {
         )
         .await?;
         let built = async {
+            #[cfg(not(any(target_os = "ios", test)))]
             let mapped = before(
                 deadline,
                 get_xormapped_addr(&conn, remote, STUN_GATHER_TIMEOUT),
             )
             .await?;
+            #[cfg(any(target_os = "ios", test))]
+            let (mapped, candidate_conn, observed) = {
+                let (mapped, matched) = before(
+                    deadline,
+                    observed_mapping(&conn, remote, STUN_GATHER_TIMEOUT),
+                )
+                .await?;
+                if _require_translated_v4 && (!matched || !mapped.ip.is_ipv4()) {
+                    return Err(Error::ErrGetXorMappedAddrResponse);
+                }
+                let candidate_conn = before(
+                    deadline,
+                    crate::nat64::candidate_socket(
+                        &conn,
+                        remote,
+                        &mapped,
+                        matched,
+                        _host,
+                        &params.dns64,
+                    ),
+                )
+                .await?;
+                let observed = (matched
+                    && mapped.port != 0
+                    && !mapped.ip.is_unspecified()
+                    && !mapped.ip.is_multicast())
+                .then_some(mapped.ip);
+                (mapped, candidate_conn, observed)
+            };
+            #[cfg(not(any(target_os = "ios", test)))]
+            let (candidate_conn, observed) = (Arc::clone(&conn), None);
             let local = conn.local_addr()?;
             let config = CandidateServerReflexiveConfig {
                 base_config: CandidateBaseConfig {
@@ -783,19 +930,22 @@ impl Agent {
                     address: mapped.ip.to_string(),
                     port: mapped.port,
                     component: COMPONENT_RTP,
-                    conn: Some(Arc::clone(&conn)),
+                    conn: Some(candidate_conn),
                     ..Default::default()
                 },
                 rel_addr: local.ip().to_string(),
                 rel_port: local.port(),
             };
-            config.new_candidate_server_reflexive()
+            Ok((config.new_candidate_server_reflexive()?, observed))
         }
         .await;
         // VNet keeps its own socket-map reference; dropping a failed STUN socket alone
         // doesn't release the port there. A registered candidate instead owns this socket.
-        let candidate: Arc<dyn Candidate + Send + Sync> = match built {
-            Ok(candidate) => Arc::new(candidate),
+        let (candidate, observed) = match built {
+            Ok((candidate, observed)) => (
+                Arc::new(candidate) as Arc<dyn Candidate + Send + Sync>,
+                observed,
+            ),
             Err(err) => {
                 let _ = conn.close().await;
                 return Err(err);
@@ -805,7 +955,7 @@ impl Agent {
             let _ = candidate.close().await;
             return Err(err);
         }
-        Ok(())
+        Ok(observed)
     }
 
     pub(crate) async fn gather_candidates_relay(

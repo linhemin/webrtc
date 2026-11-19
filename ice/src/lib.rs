@@ -7,6 +7,8 @@ pub mod control;
 mod error;
 pub mod external_ip_mapper;
 pub mod mdns;
+#[cfg(any(target_os = "ios", test))]
+mod nat64;
 pub mod network_type;
 pub mod priority;
 pub mod rand;

@@ -64,6 +64,20 @@ pub async fn get_xormapped_addr(
     Ok(addr)
 }
 
+/// Preserve the existing gathering result. A cross-family socket adapter additionally needs
+/// proof that this particular request was answered by its configured STUN endpoint.
+#[cfg(any(target_os = "ios", test))]
+pub(crate) async fn observed_mapping(
+    conn: &Arc<dyn Conn + Send + Sync>,
+    server_addr: SocketAddr,
+    deadline: Duration,
+) -> Result<(XorMappedAddress, bool)> {
+    let (response, matched) = stun_exchange(conn, server_addr, deadline).await?;
+    let mut mapped = XorMappedAddress::default();
+    mapped.get_from(&response)?;
+    Ok((mapped, matched))
+}
+
 const MAX_MESSAGE_SIZE: usize = 1280;
 
 pub async fn stun_request(
@@ -71,12 +85,20 @@ pub async fn stun_request(
     server_addr: SocketAddr,
     deadline: Duration,
 ) -> Result<Message> {
+    Ok(stun_exchange(conn, server_addr, deadline).await?.0)
+}
+
+async fn stun_exchange(
+    conn: &Arc<dyn Conn + Send + Sync>,
+    server_addr: SocketAddr,
+    deadline: Duration,
+) -> Result<(Message, bool)> {
     let mut request = Message::new();
     request.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
 
     conn.send_to(&request.raw, server_addr).await?;
     let mut bs = vec![0_u8; MAX_MESSAGE_SIZE];
-    let (n, _) = if deadline > Duration::from_secs(0) {
+    let (n, source) = if deadline > Duration::from_secs(0) {
         match tokio::time::timeout(deadline, conn.recv_from(&mut bs)).await {
             Ok(result) => match result {
                 Ok((n, addr)) => (n, addr),
@@ -92,7 +114,10 @@ pub async fn stun_request(
     res.raw = bs[..n].to_vec();
     res.decode()?;
 
-    Ok(res)
+    let matched = source == server_addr
+        && res.typ == BINDING_SUCCESS
+        && res.transaction_id == request.transaction_id;
+    Ok((res, matched))
 }
 
 pub async fn local_interfaces(
