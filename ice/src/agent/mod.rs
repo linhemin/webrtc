@@ -3,6 +3,8 @@ mod agent_gather_test;
 #[cfg(test)]
 mod agent_test;
 #[cfg(test)]
+mod nomination_test;
+#[cfg(test)]
 mod agent_transport_test;
 #[cfg(test)]
 pub(crate) mod agent_vnet_test;
@@ -55,6 +57,7 @@ use crate::url::*;
 pub(crate) struct BindingRequest {
     pub(crate) timestamp: Instant,
     pub(crate) transaction_id: TransactionId,
+    pub(crate) local_id: String,
     pub(crate) destination: SocketAddr,
     pub(crate) is_use_candidate: bool,
 }
@@ -64,6 +67,7 @@ impl Default for BindingRequest {
         Self {
             timestamp: Instant::now(),
             transaction_id: TransactionId::default(),
+            local_id: String::new(),
             destination: SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 0),
             is_use_candidate: false,
         }

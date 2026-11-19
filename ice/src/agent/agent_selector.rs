@@ -107,6 +107,48 @@ impl AgentInternal {
         }
     }
 
+    // Give other trickled candidates one short opportunity after the first successful check.
+    // A single wake is scheduled per ICE generation even if no other candidates reply.
+    fn nomination_window_elapsed(&self) -> bool {
+        let mut deadline = self.nomination_deadline.lock();
+        if let Some(until) = *deadline {
+            return Instant::now() >= until;
+        }
+        let until = Instant::now() + Duration::from_millis(100);
+        *deadline = Some(until);
+        let wake = self.force_candidate_contact_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(until).await;
+            let _ = wake.try_send(true);
+        });
+        false
+    }
+
+    async fn try_nominate_best(&self) -> bool {
+        let Some(pair) = self
+            .agent_conn
+            .get_best_valid_candidate_pair(|p| {
+                self.is_nominatable(&p.local) && self.is_nominatable(&p.remote)
+            })
+            .await
+        else {
+            return false;
+        };
+        if !self.nomination_window_elapsed() {
+            return false;
+        }
+        {
+            let mut nominated = self.nominated_pair.lock().await;
+            if nominated.is_some() || self.agent_conn.get_selected_pair().is_some() {
+                return true;
+            }
+            pair.nominated.store(true, Ordering::SeqCst);
+            *nominated = Some(pair);
+        }
+        self.nominate_pair().await;
+        true
+    }
+
     async fn nominate_pair(&self) {
         let result = {
             let nominated_pair = self.nominated_pair.lock().await;
@@ -223,6 +265,7 @@ impl ControllingSelector for AgentInternal {
             *nominated_pair = None;
         }
         *self.start_time.lock() = Instant::now();
+        *self.nomination_deadline.lock() = None;
     }
 
     async fn contact_candidates(&self) {
@@ -244,32 +287,8 @@ impl ControllingSelector for AgentInternal {
             }
         } else if nominated_pair_is_some {
             self.nominate_pair().await;
-        } else {
-            let has_nominated_pair =
-                if let Some(p) = self.agent_conn.get_best_valid_candidate_pair().await {
-                    self.is_nominatable(&p.local) && self.is_nominatable(&p.remote)
-                } else {
-                    false
-                };
-
-            if has_nominated_pair {
-                if let Some(p) = self.agent_conn.get_best_valid_candidate_pair().await {
-                    log::trace!(
-                        "Nominatable pair found, nominating ({}, {})",
-                        p.local,
-                        p.remote
-                    );
-                    p.nominated.store(true, Ordering::SeqCst);
-                    {
-                        let mut nominated_pair = self.nominated_pair.lock().await;
-                        *nominated_pair = Some(p);
-                    }
-                }
-
-                self.nominate_pair().await;
-            } else {
-                self.ping_all_candidates().await;
-            }
+        } else if !self.try_nominate_best().await {
+            self.ping_all_candidates().await;
         }
     }
 
@@ -315,7 +334,7 @@ impl ControllingSelector for AgentInternal {
 
             // Assert that NAT is not symmetric
             // https://tools.ietf.org/html/rfc8445#section-7.2.5.2.1
-            if transaction_addr != remote_addr {
+            if transaction_addr != remote_addr || pending_request.local_id != local.id() {
                 log::debug!("discard message: transaction source and destination does not match expected({}), actual({})", transaction_addr, remote);
                 return;
             }
@@ -328,6 +347,9 @@ impl ControllingSelector for AgentInternal {
             let selected_pair_is_none = self.agent_conn.get_selected_pair().is_none();
 
             if let Some(p) = self.find_pair(local, remote).await {
+                p.check_rtt
+                    .lock()
+                    .record(pending_request.timestamp.elapsed());
                 p.state
                     .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                 log::trace!(
@@ -339,6 +361,8 @@ impl ControllingSelector for AgentInternal {
                 );
                 if pending_request.is_use_candidate && selected_pair_is_none {
                     self.set_selected_pair(Some(Arc::clone(&p))).await;
+                } else if selected_pair_is_none {
+                    self.nomination_window_elapsed();
                 }
             } else {
                 // This shouldn't happen
@@ -362,43 +386,11 @@ impl ControllingSelector for AgentInternal {
         self.send_binding_success(m, local, remote).await;
         log::trace!("controllingSelector: sendBindingSuccess");
 
-        if let Some(p) = self.find_pair(local, remote).await {
-            let nominated_pair_is_none = {
-                let nominated_pair = self.nominated_pair.lock().await;
-                nominated_pair.is_none()
-            };
-
-            log::trace!(
-                "controllingSelector: after findPair {}, p.state: {}, {}",
-                p,
-                p.state.load(Ordering::SeqCst),
-                nominated_pair_is_none,
-                //self.agent_conn.get_selected_pair().await.is_none() //, {}
-            );
-            if p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8
-                && nominated_pair_is_none
-                && self.agent_conn.get_selected_pair().is_none()
+        if self.find_pair(local, remote).await.is_some() {
+            if self.agent_conn.get_selected_pair().is_none()
+                && self.nominated_pair.lock().await.is_none()
             {
-                if let Some(best_pair) = self.agent_conn.get_best_available_candidate_pair().await {
-                    log::trace!(
-                        "controllingSelector: getBestAvailableCandidatePair {}",
-                        best_pair
-                    );
-                    if best_pair == p
-                        && self.is_nominatable(&p.local)
-                        && self.is_nominatable(&p.remote)
-                    {
-                        log::trace!("The candidate ({}, {}) is the best candidate available, marking it as nominated",
-                            p.local, p.remote);
-                        {
-                            let mut nominated_pair = self.nominated_pair.lock().await;
-                            *nominated_pair = Some(p);
-                        }
-                        self.nominate_pair().await;
-                    }
-                } else {
-                    log::trace!("No best pair available");
-                }
+                self.try_nominate_best().await;
             }
         } else {
             log::trace!("controllingSelector: addPair");
@@ -473,7 +465,7 @@ impl ControlledSelector for AgentInternal {
 
             // Assert that NAT is not symmetric
             // https://tools.ietf.org/html/rfc8445#section-7.2.5.2.1
-            if transaction_addr != remote_addr {
+            if transaction_addr != remote_addr || pending_request.local_id != local.id() {
                 log::debug!("discard message: transaction source and destination does not match expected({}), actual({})", transaction_addr, remote);
                 return;
             }
@@ -485,6 +477,9 @@ impl ControlledSelector for AgentInternal {
             );
 
             if let Some(p) = self.find_pair(local, remote).await {
+                p.check_rtt
+                    .lock()
+                    .record(pending_request.timestamp.elapsed());
                 p.state
                     .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                 log::trace!("Found valid candidate pair: {}", p);

@@ -336,6 +336,7 @@ async fn test_handle_peer_reflexive_unknown_remote() -> Result<()> {
             *pending_binding_requests = vec![BindingRequest {
                 timestamp: Instant::now(),
                 transaction_id: tid,
+                local_id: String::new(),
                 destination: SocketAddr::from_str("0.0.0.0:0")?,
                 is_use_candidate: false,
             }];

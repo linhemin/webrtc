@@ -47,6 +47,7 @@ pub struct AgentInternal {
 
     pub(crate) start_time: SyncMutex<Instant>,
     pub(crate) nominated_pair: Mutex<Option<Arc<CandidatePair>>>,
+    pub(crate) nomination_deadline: SyncMutex<Option<Instant>>,
 
     pub(crate) connection_state: AtomicU8, //ConnectionState,
 
@@ -118,6 +119,7 @@ impl AgentInternal {
 
             start_time: SyncMutex::new(Instant::now()),
             nominated_pair: Mutex::new(None),
+            nomination_deadline: SyncMutex::new(None),
 
             connection_state: AtomicU8::new(ConnectionState::New as u8),
 
@@ -726,6 +728,7 @@ impl AgentInternal {
             pending_binding_requests.push(BindingRequest {
                 timestamp: Instant::now(),
                 transaction_id: m.transaction_id,
+                local_id: local.id(),
                 destination: remote.addr(),
                 is_use_candidate: m.contains(ATTR_USE_CANDIDATE),
             });

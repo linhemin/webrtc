@@ -218,12 +218,16 @@ impl AgentInternal {
         let checklist = self.agent_conn.checklist.lock().await;
         let mut res = Vec::with_capacity(checklist.len());
         for cp in &*checklist {
+            let rtt = *cp.check_rtt.lock();
             let stat = CandidatePairStats {
                 timestamp: Instant::now(),
                 local_candidate_id: cp.local.id(),
                 remote_candidate_id: cp.remote.id(),
                 state: cp.state.load(Ordering::SeqCst).into(),
                 nominated: cp.nominated.load(Ordering::SeqCst),
+                current_round_trip_time: rtt.latest.as_secs_f64(),
+                total_round_trip_time: rtt.total.as_secs_f64(),
+                responses_received: rtt.samples,
                 ..CandidatePairStats::default()
             };
             res.push(stat);

@@ -131,25 +131,38 @@ impl AgentConn {
         best.cloned()
     }
 
-    pub(crate) async fn get_best_valid_candidate_pair(&self) -> Option<Arc<CandidatePair>> {
-        let mut best: Option<&Arc<CandidatePair>> = None;
-
+    pub(crate) async fn get_best_valid_candidate_pair(
+        &self,
+        eligible: impl Fn(&CandidatePair) -> bool,
+    ) -> Option<Arc<CandidatePair>> {
         let checklist = self.checklist.lock().await;
-        for p in &*checklist {
-            if p.state.load(Ordering::SeqCst) != CandidatePairState::Succeeded as u8 {
-                continue;
-            }
+        let mut samples: Vec<_> = checklist
+            .iter()
+            .filter(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8)
+            .filter(|p| eligible(p))
+            .map(|p| {
+                let direct = p.local.candidate_type() != CandidateType::Relay
+                    && p.remote.candidate_type() != CandidateType::Relay;
+                let rtt = *p.check_rtt.lock();
+                (p, direct, (rtt.samples > 0).then_some(rtt.latest))
+            })
+            .collect();
 
-            if let Some(b) = &mut best {
-                if b.priority() < p.priority() {
-                    *b = p;
-                }
-            } else {
-                best = Some(p);
-            }
+        if samples.iter().any(|(_, direct, _)| *direct) {
+            samples.retain(|(_, direct, _)| *direct);
         }
-
-        best.cloned()
+        let (preferred, _, preferred_rtt) = samples.iter().max_by_key(|(p, _, _)| p.priority())?;
+        if preferred_rtt.is_none() {
+            return Some(Arc::clone(preferred));
+        }
+        let fastest = samples.iter().filter_map(|(_, _, rtt)| *rtt).min()?;
+        // Preserve the ICE preference when the measured difference is within timing jitter.
+        let cutoff = fastest + (fastest / 10).max(Duration::from_millis(2));
+        samples
+            .into_iter()
+            .filter(|(_, _, rtt)| rtt.is_some_and(|v| v <= cutoff))
+            .max_by_key(|(p, _, rtt)| (p.priority(), std::cmp::Reverse(*rtt)))
+            .map(|(pair, _, _)| pair.clone())
     }
 
     /// Returns the number of bytes sent.

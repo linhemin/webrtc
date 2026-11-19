@@ -17,13 +17,14 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use candidate_base::*;
 use portable_atomic::{AtomicBool, AtomicU16, AtomicU8};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
+use util::sync::Mutex as SyncMutex;
 
 use crate::error::Result;
 use crate::network_type::*;
@@ -235,6 +236,22 @@ pub struct CandidatePair {
     pub(crate) state: AtomicU8, // convert it to CandidatePairState,
     pub(crate) nominated: AtomicBool,
     pub(crate) nominate_on_binding_success: AtomicBool,
+    pub(crate) check_rtt: SyncMutex<CheckRtt>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CheckRtt {
+    pub(crate) latest: Duration,
+    pub(crate) total: Duration,
+    pub(crate) samples: u64,
+}
+
+impl CheckRtt {
+    pub(crate) fn record(&mut self, elapsed: Duration) {
+        self.latest = elapsed;
+        self.total = self.total.saturating_add(elapsed);
+        self.samples = self.samples.saturating_add(1);
+    }
 }
 
 impl Default for CandidatePair {
@@ -247,6 +264,7 @@ impl Default for CandidatePair {
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
             nominate_on_binding_success: AtomicBool::new(false),
+            check_rtt: SyncMutex::new(CheckRtt::default()),
         }
     }
 }
@@ -300,6 +318,7 @@ impl CandidatePair {
             binding_request_count: AtomicU16::new(0),
             nominated: AtomicBool::new(false),
             nominate_on_binding_success: AtomicBool::new(false),
+            check_rtt: SyncMutex::new(CheckRtt::default()),
         }
     }
 
