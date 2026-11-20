@@ -33,16 +33,7 @@ fn usable_unicast(v4: Ipv4Addr) -> bool {
     first != 0 && first != 127 && first < 224 && !v4.is_link_local()
 }
 
-pub(crate) fn globally_reachable_ipv4(v4: Ipv4Addr) -> bool {
-    let [a, b, c, d] = v4.octets();
-    usable_unicast(v4)
-        && !v4.is_private()
-        && !v4.is_documentation()
-        && !(a == 100 && (64..=127).contains(&b))
-        && !(a == 198 && (b == 18 || b == 19))
-        && !(a == 192 && b == 88 && c == 99)
-        && !(a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
-}
+pub(crate) use crate::util::globally_reachable_ipv4;
 
 impl Prefix {
     fn permits(self, v4: Ipv4Addr) -> bool {
@@ -239,6 +230,11 @@ impl Translated {
             .filter(|ip| address.port() != 0 && self.prefix.permits(*ip))
             .map(|ip| SocketAddr::new(ip.into(), address.port()))
     }
+}
+
+/// Convert an already-resolved DNS64 observer to the address family exposed by this candidate.
+pub(crate) fn observer_v4(socket: &Socket, address: SocketAddr) -> Option<SocketAddr> {
+    socket.as_any().downcast_ref::<Translated>()?.source(address)
 }
 
 #[async_trait]

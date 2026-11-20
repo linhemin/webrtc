@@ -62,6 +62,17 @@ pub type IpFilterFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 pub trait InterfaceStunProvider: Send + Sync {
     fn supports_source(&self, source: Ipv4Addr) -> bool;
 
+    /// Resolve a configured STUN observer using the same DNS policy as the bound socket.
+    /// An unavailable observer leaves a cross-destination measurement inconclusive.
+    async fn resolve_for_socket(
+        &self,
+        _source: Ipv4Addr,
+        _host: &str,
+        _port: u16,
+    ) -> Option<std::net::SocketAddrV4> {
+        None
+    }
+
     async fn bind_and_resolve(
         &self,
         source: Ipv4Addr,

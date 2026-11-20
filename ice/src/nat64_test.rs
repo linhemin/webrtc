@@ -319,7 +319,7 @@ async fn only_expected_stun_source_transaction_and_success_witness_the_mapping()
             observed_mapping(&client, addr, Duration::from_secs(1), &rx),
             response
         );
-        let (mapped, matched) = result.unwrap();
+        let (mapped, matched, _) = result.unwrap();
         assert_eq!(mapped.port, 34567);
         assert_eq!(matched, invalid.is_none());
         let snap = rx.snapshot().unwrap();

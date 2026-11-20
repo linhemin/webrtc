@@ -90,6 +90,31 @@ impl RTCIceTransport {
         self.gatherer.get_agent().await?.udp_socket_diagnostics()
     }
 
+    /// Compare configured STUN observers on the agent's already published UDP sockets.
+    pub async fn measure_udp_mappings(
+        &self,
+    ) -> Option<ice::agent::mapping_probe::MappingProbeStats> {
+        Some(
+            self.gatherer
+                .get_agent()
+                .await?
+                .measure_udp_mappings()
+                .await,
+        )
+    }
+
+    pub async fn udp_mapping_stats(&self) -> Option<ice::agent::mapping_probe::MappingProbeStats> {
+        self.gatherer.get_agent().await?.udp_mapping_stats()
+    }
+
+    /// Wake the standard connectivity checklist when a live peer has signalled readiness.
+    pub async fn request_connectivity_check(&self) -> bool {
+        match self.gatherer.get_agent().await {
+            Some(agent) => agent.request_connectivity_check().await,
+            None => false,
+        }
+    }
+
     /// get_selected_candidate_pair returns the selected candidate pair on which packets are sent
     /// if there is no selected pair nil is returned
     pub async fn get_selected_candidate_pair(&self) -> Option<RTCIceCandidatePair> {

@@ -872,12 +872,16 @@ impl Agent {
         // Adding a duplicate also returns Ok. Report only a published candidate that owns
         // this exact verified socket, so the service log can distinguish gathering from use.
         let locals = params.agent_internal.local_candidates.lock().await;
-        if locals.get(&NetworkType::Udp4).is_some_and(|candidates| {
-            candidates.iter().any(|c| {
+        if let Some(candidate) = locals.get(&NetworkType::Udp4).and_then(|candidates| {
+            candidates.iter().find(|c| {
                 c.get_conn()
                     .is_some_and(|socket| Arc::ptr_eq(socket, &conn))
             })
         }) {
+            params
+                .agent_internal
+                .mapping_probes
+                .mark_physical(candidate);
             log::info!("Published interface-bound IPv4 STUN candidate");
         }
         Ok(())
@@ -993,7 +997,7 @@ impl Agent {
         require_mapped_v4: bool,
     ) -> Result<Option<IpAddr>> {
         let built = async {
-            let (mapped, matched) = before(
+            let (mapped, matched, response) = before(
                 deadline,
                 observed_mapping(
                     &conn,
@@ -1049,15 +1053,17 @@ impl Agent {
             Ok((
                 config.new_candidate_server_reflexive()?,
                 valid.then_some(mapped.ip),
+                matched.then_some(response),
             ))
         }
         .await;
         // VNet keeps its own socket-map reference; dropping a failed STUN socket alone
         // doesn't release the port there. A registered candidate instead owns this socket.
-        let (candidate, observed) = match built {
-            Ok((candidate, observed)) => (
+        let (candidate, observed, response) = match built {
+            Ok((candidate, observed, response)) => (
                 Arc::new(candidate) as Arc<dyn Candidate + Send + Sync>,
                 observed,
+                response,
             ),
             Err(err) => {
                 let _ = conn.close().await;
@@ -1067,6 +1073,20 @@ impl Agent {
         if let Err(err) = params.agent_internal.add_candidate(&candidate).await {
             let _ = candidate.close().await;
             return Err(err);
+        }
+        if let Some(response) = response {
+            let locals = params.agent_internal.local_candidates.lock().await;
+            if locals
+                .get(&NetworkType::Udp4)
+                .into_iter()
+                .flatten()
+                .any(|c| Arc::ptr_eq(c, &candidate))
+            {
+                params
+                    .agent_internal
+                    .mapping_probes
+                    .remember(&candidate, remote, &response);
+            }
         }
         Ok(observed)
     }

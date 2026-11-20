@@ -21,6 +21,7 @@ pub(crate) struct UfragPwd {
 }
 
 pub struct AgentInternal {
+    pub(crate) mapping_probes: super::mapping_probe::Probes,
     pub(crate) socket_rx: super::socket_diagnostics::SocketCounters,
     // State owned by the taskLoop
     pub(crate) on_connected_tx: Mutex<Option<mpsc::Sender<()>>>,
@@ -96,6 +97,7 @@ impl AgentInternal {
         let (started_ch_tx, _) = broadcast::channel(1);
 
         let ai = AgentInternal {
+            mapping_probes: Default::default(),
             socket_rx: Default::default(),
             on_connected_tx: Mutex::new(Some(on_connected_tx)),
             on_connected_rx: Mutex::new(Some(on_connected_rx)),
@@ -502,7 +504,7 @@ impl AgentInternal {
         }
     }
 
-    fn request_connectivity_check(&self) {
+    pub(crate) fn request_connectivity_check(&self) {
         let _ = self.force_candidate_contact_tx.try_send(true);
     }
 
@@ -1186,7 +1188,7 @@ impl AgentInternal {
                     src_addr,
                     err
                 );
-            } else {
+            } else if !self.mapping_probes.deliver(c, src_addr, &m) {
                 self.handle_inbound(&mut m, c, src_addr).await;
             }
         } else {

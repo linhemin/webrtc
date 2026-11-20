@@ -21,6 +21,17 @@ use crate::agent::socket_diagnostics::SocketCounters;
 use crate::error::*;
 use crate::network_type::*;
 
+pub(crate) fn globally_reachable_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, d] = v4.octets();
+    (a != 0 && a != 127 && a < 224 && !v4.is_link_local())
+        && !v4.is_private()
+        && !v4.is_documentation()
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 198 && (b == 18 || b == 19))
+        && !(a == 192 && b == 88 && c == 99)
+        && !(a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+}
+
 pub fn create_addr(_network: NetworkType, ip: IpAddr, port: u16) -> SocketAddr {
     /*if network.is_tcp(){
         return &net.TCPAddr{IP: ip, Port: port}
@@ -72,11 +83,11 @@ pub(crate) async fn observed_mapping(
     server_addr: SocketAddr,
     deadline: Duration,
     socket_rx: &SocketCounters,
-) -> Result<(XorMappedAddress, bool)> {
+) -> Result<(XorMappedAddress, bool, Message)> {
     let (response, matched) = stun_exchange(conn, server_addr, deadline, Some(socket_rx)).await?;
     let mut mapped = XorMappedAddress::default();
     mapped.get_from(&response)?;
-    Ok((mapped, matched))
+    Ok((mapped, matched, response))
 }
 
 const MAX_MESSAGE_SIZE: usize = 1280;

@@ -18,6 +18,7 @@ pub mod agent_selector;
 pub mod agent_stats;
 pub mod agent_transport;
 pub mod socket_diagnostics;
+pub mod mapping_probe;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -421,6 +422,8 @@ impl Agent {
                 return Err(Error::ErrClosed);
             }
         }
+
+        self.internal.mapping_probes.reset();
 
         // Clear all agent needed to take back to fresh state
         {

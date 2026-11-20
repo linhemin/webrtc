@@ -3174,6 +3174,7 @@ dependencies = [
  "clap 3.2.25",
  "crc",
  "env_logger",
+ "futures-util",
  "hyper",
  "ipnet",
  "lazy_static",

@@ -21,6 +21,7 @@ mdns = { version = "0.9.0", path = "../mdns", package = "webrtc-mdns" }
 arc-swap = "1"
 async-trait = "0.1"
 crc = "3"
+futures-util = "0.3"
 log = "0.4"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
