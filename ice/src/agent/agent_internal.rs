@@ -548,6 +548,14 @@ impl AgentInternal {
         self: &Arc<Self>,
         c: &Arc<dyn Candidate + Send + Sync>,
     ) -> Result<()> {
+        self.install_candidate(c, true).await
+    }
+
+    pub(crate) async fn install_candidate(
+        self: &Arc<Self>,
+        c: &Arc<dyn Candidate + Send + Sync>,
+        notify_gatherer: bool,
+    ) -> Result<()> {
         let initialized_ch = {
             let started_ch_tx = self.started_ch_tx.lock().await;
             (*started_ch_tx).as_ref().map(|tx| tx.subscribe())
@@ -594,7 +602,7 @@ impl AgentInternal {
         }
 
         self.request_connectivity_check();
-        {
+        if notify_gatherer {
             let chan_candidate_tx = self.chan_candidate_tx.lock().await;
             if let Some(tx) = &*chan_candidate_tx {
                 let _ = tx.send(Some(c.clone())).await;
