@@ -41,7 +41,7 @@ fn installed_at(socket: Arc<dyn util::Conn + Send + Sync>, advertised: SocketAdd
     )
 }
 
-async fn read(socket: &dyn util::Conn) -> (Message, SocketAddr) {
+async fn read(socket: &(dyn util::Conn + Sync)) -> (Message, SocketAddr) {
     let mut buf = [0u8; 1024];
     let (size, src) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
         .await
@@ -432,5 +432,229 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
     assert!(agent.observed_udp_candidates().await.is_empty());
     agent.close().await.unwrap();
     peer.close().await.unwrap();
+    router.lock().await.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn grouped_mapping_uses_later_configured_observers_when_early_ones_are_silent() {
+    use crate::agent::agent_vnet_test::connect_net2router;
+    use util::vnet::{
+        net::{Net, NetConfig},
+        router::{Router, RouterConfig},
+    };
+
+    let router = Arc::new(tokio::sync::Mutex::new(
+        Router::new(RouterConfig {
+            cidr: "0.0.0.0/0".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    ));
+    let net = |ip: &str| {
+        Arc::new(Net::new(Some(NetConfig {
+            static_ips: vec![ip.into()],
+            ..Default::default()
+        })))
+    };
+    let server = net("8.8.4.4");
+    let client = net("1.1.1.1");
+    for n in [&server, &client] {
+        connect_net2router(n, &router).await.unwrap();
+    }
+    router.lock().await.start().await.unwrap();
+    let source = "1.1.1.1:45223".parse().unwrap();
+    let ports = [443, 3478, 3479, 3480, 3481, 3482, 3483];
+    let urls = ports
+        .iter()
+        .map(|p| Url::parse_url(&format!("stun:8.8.4.4:{p}")).unwrap())
+        .collect();
+    let agent = Arc::new(
+        Agent::new(AgentConfig {
+            net: Some(client.clone()),
+            urls,
+            grouped_physical_stun: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let socket = installed_at(client.bind(source).await.unwrap(), source);
+    agent.internal.started_ch_tx.lock().await.take();
+    agent.internal.add_candidate(&socket).await.unwrap();
+    agent.gathering_state.store(
+        super::super::GatheringState::Complete as u8,
+        Ordering::SeqCst,
+    );
+
+    let mut responders = Vec::new();
+    for (i, port) in ports[2..6].iter().enumerate() {
+        let observer = server
+            .bind(format!("8.8.4.4:{port}").parse().unwrap())
+            .await
+            .unwrap();
+        responders.push(tokio::spawn(async move {
+            let (req, from) = read(&*observer).await;
+            assert_eq!(from, source);
+            let mapped = SocketAddrV4::new("1.1.1.1".parse().unwrap(), 46000 + i as u16 * 13);
+            observer
+                .send_to(&success(req.transaction_id, mapped).raw, from)
+                .await
+                .unwrap();
+        }));
+    }
+    let spare = server.bind("8.8.4.4:3483".parse().unwrap()).await.unwrap();
+    let stats = agent.measure_udp_mappings().await;
+    assert_eq!(stats.ordered_profiles, [0, 1, 0, 0]);
+    for task in responders {
+        task.await.unwrap();
+    }
+    let mut buf = [0; 128];
+    assert!(
+        timeout(Duration::from_millis(50), spare.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+    agent.close().await.unwrap();
+    router.lock().await.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_cross_slot_check_opens_a_path_before_ordinary_trickle() {
+    use crate::agent::agent_vnet_test::connect_net2router;
+    use util::{
+        vnet::{
+            net::{Net, NetConfig},
+            router::{Router, RouterConfig},
+        },
+        Conn,
+    };
+
+    let wan = Router::new(RouterConfig {
+        cidr: "0.0.0.0/0".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let phone: [SocketAddr; 2] = [
+        "1.1.1.1:42000".parse().unwrap(),
+        "1.1.1.1:42001".parse().unwrap(),
+    ];
+    let desk: [SocketAddr; 2] = [
+        "8.8.4.4:43000".parse().unwrap(),
+        "8.8.4.4:43001".parse().unwrap(),
+    ];
+    wan.add_chunk_filter(Box::new(move |packet| {
+        let path = (packet.source_addr(), packet.destination_addr());
+        path == (phone[1], desk[0]) || path == (desk[0], phone[1])
+    }))
+    .await;
+    let router = Arc::new(tokio::sync::Mutex::new(wan));
+    let mut agents = Vec::new();
+    let mut locals = Vec::new();
+    for addresses in [phone, desk] {
+        let net = Arc::new(Net::new(Some(NetConfig {
+            static_ips: vec![addresses[0].ip().to_string()],
+            ..Default::default()
+        })));
+        connect_net2router(&net, &router).await.unwrap();
+        let agent = Arc::new(
+            Agent::new(AgentConfig {
+                net: Some(net.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let mut sockets = Vec::new();
+        for addr in addresses {
+            let candidate = installed_at(net.bind(addr).await.unwrap(), addr);
+            agent.internal.add_candidate(&candidate).await.unwrap();
+            sockets.push(candidate);
+        }
+        locals.push(sockets);
+        agents.push(agent);
+    }
+    router.lock().await.start().await.unwrap();
+    let a = agents[0].clone();
+    let b = agents[1].clone();
+    let (au, ap) = a.get_local_user_credentials().await;
+    let (bu, bp) = b.get_local_user_credentials().await;
+    let (_at, ar) = tokio::sync::mpsc::channel(1);
+    let (_bt, br) = tokio::sync::mpsc::channel(1);
+    let at = tokio::spawn(async move { a.dial(ar, bu, bp).await });
+    let bt = tokio::spawn(async move { b.accept(br, au, ap).await });
+    for agent in &agents {
+        timeout(Duration::from_secs(1), async {
+            while agent
+                .internal
+                .ufrag_pwd
+                .lock()
+                .await
+                .remote_ufrag
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    for i in 0..2 {
+        for side in 0..2 {
+            assert!(
+                agents[side]
+                    .timed_first_check(&locals[side][i].id(), &locals[1 - side][i].marshal())
+                    .await
+            );
+        }
+    }
+    sleep(Duration::from_millis(60)).await;
+    for agent in &agents {
+        assert_eq!(agent.udp_socket_diagnostics().unwrap().req_accepted, 0);
+    }
+
+    assert!(
+        agents[0]
+            .timed_first_check(&locals[0][1].id(), &locals[1][0].marshal())
+            .await
+    );
+    timeout(Duration::from_secs(2), async {
+        while agents[1].udp_socket_diagnostics().unwrap().req_accepted == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Release the ordinary candidate stream as the application does.
+    for side in 0..2 {
+        for c in &locals[1 - side] {
+            let parsed: Local = Arc::new(
+                crate::candidate::candidate_base::unmarshal_candidate(&c.marshal()).unwrap(),
+            );
+            agents[side].add_remote_candidate(&parsed).unwrap();
+        }
+    }
+    timeout(Duration::from_secs(8), async {
+        let a = at.await.unwrap().unwrap();
+        let b = bt.await.unwrap().unwrap();
+        let mut buf = [0; 12];
+        a.send(b"phone").await.unwrap();
+        let n = b.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"phone");
+        b.send(b"desktop").await.unwrap();
+        let n = a.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"desktop");
+        let selected = agents[0].get_selected_candidate_pair().unwrap();
+        assert_eq!(
+            (selected.local.addr(), selected.remote.addr()),
+            (phone[1], desk[0])
+        );
+    })
+    .await
+    .unwrap();
+    for a in agents {
+        a.close().await.unwrap();
+    }
     router.lock().await.stop().await.unwrap();
 }

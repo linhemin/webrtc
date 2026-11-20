@@ -32,6 +32,8 @@ const MAX_SOCKETS: usize = 6;
 const MAX_SIGNALED_MAPPINGS: usize = 6;
 const MAX_MAPPINGS_PER_SOCKET: usize = 2;
 const MAX_OBSERVERS: usize = 4;
+const MAX_OBSERVER_URLS: usize = 8;
+const ORDERED_OBSERVER_BUDGET: Duration = Duration::from_millis(2500);
 const REPLY_WAIT: Duration = Duration::from_millis(810);
 const RETRY_AFTER: Duration = Duration::from_millis(350);
 
@@ -295,25 +297,27 @@ fn observed_profile(series: &[SocketAddrV4]) -> usize {
 async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], ordered: bool) -> Sample {
     let mut result = Sample::default();
     let gathered = probes.gathered.lock().get(&socket.id()).copied();
-    let replies = if ordered {
-        let mut replies = Vec::with_capacity(endpoints.len());
+    let mut observations = Vec::new();
+    if ordered {
+        // A silent configured server need not displace a reachable one. Keep
+        // samples in send order and reserve time for the alternate-port test.
+        let deadline = Instant::now() + ORDERED_OBSERVER_BUDGET;
         for &ep in endpoints {
-            let reply = timeout(Duration::from_millis(450), probes.query(socket, ep, ep, false))
-                .await.ok().flatten();
-            replies.push(reply);
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() || observations.len() == MAX_OBSERVERS {
+                break;
+            }
+            let query = probes.query(socket, ep, ep, false);
+            if let Ok(Some(obs)) = timeout(wait.min(Duration::from_millis(450)), query).await {
+                observations.push((ep, obs));
+            }
         }
-        replies
     } else {
-        join_all(endpoints.iter().map(|&ep| probes.query(socket, ep, ep, false))).await
-    };
-    // Deduplicate by destination. A repeated request to one observer cannot establish stability.
-    // The matched gather response is the observation that originated this published candidate.
-    let mut observations: Vec<_> = endpoints
-        .iter()
-        .copied()
-        .zip(replies)
-        .filter_map(|(ep, obs)| obs.map(|o| (ep, o)))
-        .collect();
+        let pairs = endpoints.iter().take(MAX_OBSERVERS).map(|&ep| async move {
+            probes.query(socket, ep, ep, false).await.map(|obs| (ep, obs))
+        });
+        observations.extend(join_all(pairs).await.into_iter().flatten());
+    }
     // Classify only live queries to distinct destinations in send order.
     // The cached gather mapping does not establish its allocation order.
     let mut live: Vec<_> = observations.iter().map(|(ep, obs)| (*ep, obs.mapped)).collect();
@@ -632,7 +636,7 @@ impl Agent {
             .urls
             .iter()
             .filter(|u| u.scheme == SchemeType::Stun && u.proto == ProtoType::Udp)
-            .take(8)
+            .take(MAX_OBSERVER_URLS)
             .collect();
         urls.sort_by_key(|u| u.port != 443);
         let resolving = urls.into_iter().map(|url| async move {
@@ -671,7 +675,7 @@ impl Agent {
             if !out.contains(&ep) {
                 out.push(ep);
             }
-            if out.len() == MAX_OBSERVERS {
+            if !self.grouped_physical_stun && out.len() == MAX_OBSERVERS {
                 break;
             }
         }
