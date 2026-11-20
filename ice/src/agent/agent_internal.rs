@@ -365,10 +365,7 @@ impl AgentInternal {
     pub(crate) async fn ping_all_candidates(&self) {
         log::trace!("[{}]: pinging all candidates", self.get_name(),);
 
-        let mut pairs: Vec<(
-            Arc<dyn Candidate + Send + Sync>,
-            Arc<dyn Candidate + Send + Sync>,
-        )> = vec![];
+        let mut pairs = vec![];
 
         {
             let mut checklist = self.agent_conn.checklist.lock().await;
@@ -397,15 +394,13 @@ impl AgentInternal {
                         .store(CandidatePairState::Failed as u8, Ordering::SeqCst);
                 } else {
                     p.binding_request_count.fetch_add(1, Ordering::SeqCst);
-                    let local = p.local.clone();
-                    let remote = p.remote.clone();
-                    pairs.push((local, remote));
+                    pairs.push(p.clone());
                 }
             }
         }
 
-        for (local, remote) in pairs {
-            self.ping_candidate(&local, &remote).await;
+        for pair in pairs {
+            self.ping_candidate(&pair).await;
         }
     }
 
@@ -413,14 +408,15 @@ impl AgentInternal {
         &self,
         local: Arc<dyn Candidate + Send + Sync>,
         remote: Arc<dyn Candidate + Send + Sync>,
-    ) {
+    ) -> Arc<CandidatePair> {
         let p = Arc::new(CandidatePair::new(
             local,
             remote,
             self.is_controlling.load(Ordering::SeqCst),
         ));
         let mut checklist = self.agent_conn.checklist.lock().await;
-        checklist.push(p);
+        checklist.push(p.clone());
+        p
     }
 
     pub(crate) async fn find_pair(
@@ -482,19 +478,9 @@ impl AgentInternal {
     /// if no packet has been sent on that pair in the last keepaliveInterval.
     /// Note: the caller should hold the agent lock.
     pub(crate) async fn check_keepalive(&self) {
-        let (local, remote) = {
-            let selected_pair = self.agent_conn.selected_pair.load();
-            (*selected_pair)
-                .as_ref()
-                .map_or((None, None), |selected_pair| {
-                    (
-                        Some(selected_pair.local.clone()),
-                        Some(selected_pair.remote.clone()),
-                    )
-                })
-        };
-
-        if let (Some(local), Some(remote)) = (local, remote) {
+        if let Some(pair) = self.agent_conn.get_selected_pair() {
+            let local = &pair.local;
+            let remote = &pair.remote;
             let last_sent = SystemTime::now()
                 .duration_since(local.last_sent())
                 .unwrap_or_else(|_| Duration::from_secs(0));
@@ -509,7 +495,7 @@ impl AgentInternal {
             {
                 // we use binding request instead of indication to support refresh consent schemas
                 // see https://tools.ietf.org/html/rfc7675
-                self.ping_candidate(&local, &remote).await;
+                self.ping_candidate(&pair).await;
             }
         }
     }
@@ -708,12 +694,9 @@ impl AgentInternal {
         None
     }
 
-    pub(crate) async fn send_binding_request(
-        &self,
-        m: &Message,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
+    pub(crate) async fn send_binding_request(&self, m: &Message, pair: &CandidatePair) {
+        let local = &pair.local;
+        let remote = &pair.remote;
         log::trace!(
             "[{}]: ping STUN from {} to {}",
             self.get_name(),
@@ -734,15 +717,13 @@ impl AgentInternal {
             });
         }
 
-        self.send_stun(m, local, remote).await;
+        let sent = self.send_stun(m, local, remote).await;
+        pair.check_io.lock().record_sent_request(sent);
     }
 
-    pub(crate) async fn send_binding_success(
-        &self,
-        m: &Message,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
+    pub(crate) async fn send_binding_success(&self, m: &Message, pair: &CandidatePair) {
+        let local = &pair.local;
+        let remote = &pair.remote;
         let addr = remote.addr();
         let (ip, port) = (addr.ip(), addr.port());
         let local_pwd = {
@@ -771,7 +752,8 @@ impl AgentInternal {
                 err
             );
         } else {
-            self.send_stun(&out, local, remote).await;
+            let sent = self.send_stun(&out, local, remote).await;
+            pair.check_io.lock().record_sent_response(sent);
         }
     }
 
@@ -1016,13 +998,17 @@ impl AgentInternal {
         msg: &Message,
         local: &Arc<dyn Candidate + Send + Sync>,
         remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
-        if let Err(err) = local.write_to(&msg.raw, &**remote).await {
-            log::trace!(
-                "[{}]: failed to send STUN message: {}",
-                self.get_name(),
-                err
-            );
+    ) -> bool {
+        match local.write_to(&msg.raw, &**remote).await {
+            Ok(n) => n == msg.raw.len(),
+            Err(err) => {
+                log::trace!(
+                    "[{}]: failed to send STUN message: {}",
+                    self.get_name(),
+                    err
+                );
+                false
+            }
         }
     }
 

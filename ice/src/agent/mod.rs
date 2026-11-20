@@ -3,6 +3,8 @@ mod agent_gather_test;
 #[cfg(test)]
 mod agent_test;
 #[cfg(test)]
+mod check_io_test;
+#[cfg(test)]
 mod nomination_test;
 #[cfg(test)]
 mod agent_transport_test;

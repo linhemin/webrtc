@@ -268,6 +268,10 @@ pub struct ICECandidatePairStats {
     pub available_incoming_bitrate: f64,
     pub requests_received: u64,
     pub requests_sent: u64,
+    #[serde(default)]
+    pub request_send_failures: u64,
+    #[serde(default)]
+    pub response_send_failures: u64,
     pub responses_received: u64,
     pub responses_sent: u64,
     pub consent_requests_sent: u64,
@@ -308,6 +312,8 @@ impl From<CandidatePairStats> for ICECandidatePairStats {
             remote_candidate_id: stats.remote_candidate_id,
             requests_received: stats.requests_received,
             requests_sent: stats.requests_sent,
+            request_send_failures: stats.request_send_failures,
+            response_send_failures: stats.response_send_failures,
             responses_received: stats.responses_received,
             responses_sent: stats.responses_sent,
             retransmissions_sent: stats.retransmissions_sent,

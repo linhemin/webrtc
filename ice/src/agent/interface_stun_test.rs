@@ -194,7 +194,8 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
                 observed.port(),
                 "port observed by the STUN server"
             );
-            agent.internal.ping_candidate(&path, &peer).await;
+            let pair = CandidatePair::new(path, peer.clone(), true);
+            agent.internal.ping_candidate(&pair).await;
             let checked = tokio::time::timeout(Duration::from_secs(1), data.recv())
                 .await
                 .unwrap()
@@ -203,9 +204,7 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
                 checked, observed,
                 "authenticated ICE check uses the mapped socket"
             );
-            CandidatePair::new(path, peer.clone(), true)
-                .write(b"selected-pair data")
-                .await?;
+            pair.write(b"selected-pair data").await?;
             let arrived = tokio::time::timeout(Duration::from_secs(1), data.recv())
                 .await
                 .unwrap()

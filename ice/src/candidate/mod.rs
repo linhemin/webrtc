@@ -237,6 +237,34 @@ pub struct CandidatePair {
     pub(crate) nominated: AtomicBool,
     pub(crate) nominate_on_binding_success: AtomicBool,
     pub(crate) check_rtt: SyncMutex<CheckRtt>,
+    pub(crate) check_io: SyncMutex<CheckIo>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CheckIo {
+    pub(crate) requests_sent: u64,
+    pub(crate) request_send_failures: u64,
+    pub(crate) requests_received: u64,
+    pub(crate) responses_sent: u64,
+    pub(crate) response_send_failures: u64,
+}
+
+impl CheckIo {
+    pub(crate) fn record_sent_request(&mut self, sent: bool) {
+        if sent {
+            self.requests_sent += 1;
+        } else {
+            self.request_send_failures += 1;
+        }
+    }
+
+    pub(crate) fn record_sent_response(&mut self, sent: bool) {
+        if sent {
+            self.responses_sent += 1;
+        } else {
+            self.response_send_failures += 1;
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -265,6 +293,7 @@ impl Default for CandidatePair {
             nominated: AtomicBool::new(false),
             nominate_on_binding_success: AtomicBool::new(false),
             check_rtt: SyncMutex::new(CheckRtt::default()),
+            check_io: SyncMutex::default(),
         }
     }
 }
@@ -319,6 +348,7 @@ impl CandidatePair {
             nominated: AtomicBool::new(false),
             nominate_on_binding_success: AtomicBool::new(false),
             check_rtt: SyncMutex::new(CheckRtt::default()),
+            check_io: SyncMutex::default(),
         }
     }
 

@@ -93,6 +93,12 @@ pub struct CandidatePairStats {
     /// The total number of connectivity check requests sent (not including retransmissions).
     pub requests_sent: u64,
 
+    /// Binding Request datagrams the candidate socket rejected or wrote incompletely.
+    pub request_send_failures: u64,
+
+    /// Binding Success datagrams the candidate socket rejected or wrote incompletely.
+    pub response_send_failures: u64,
+
     /// The total number of connectivity check responses received.
     pub responses_received: u64,
 
@@ -137,6 +143,8 @@ impl Default for CandidatePairStats {
             circuit_breaker_trigger_count: 0,
             requests_received: 0,
             requests_sent: 0,
+            request_send_failures: 0,
+            response_send_failures: 0,
             responses_received: 0,
             responses_sent: 0,
             retransmissions_received: 0,
@@ -219,6 +227,7 @@ impl AgentInternal {
         let mut res = Vec::with_capacity(checklist.len());
         for cp in &*checklist {
             let rtt = *cp.check_rtt.lock();
+            let io = *cp.check_io.lock();
             let stat = CandidatePairStats {
                 timestamp: Instant::now(),
                 local_candidate_id: cp.local.id(),
@@ -228,6 +237,11 @@ impl AgentInternal {
                 current_round_trip_time: rtt.latest.as_secs_f64(),
                 total_round_trip_time: rtt.total.as_secs_f64(),
                 responses_received: rtt.samples,
+                requests_sent: io.requests_sent,
+                requests_received: io.requests_received,
+                responses_sent: io.responses_sent,
+                request_send_failures: io.request_send_failures,
+                response_send_failures: io.response_send_failures,
                 ..CandidatePairStats::default()
             };
             res.push(stat);

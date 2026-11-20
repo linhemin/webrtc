@@ -21,11 +21,7 @@ use crate::use_candidate::*;
 trait ControllingSelector {
     async fn start(&self);
     async fn contact_candidates(&self);
-    async fn ping_candidate(
-        &self,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    );
+    async fn ping_candidate(&self, pair: &CandidatePair);
     async fn handle_success_response(
         &self,
         m: &Message,
@@ -45,11 +41,7 @@ trait ControllingSelector {
 trait ControlledSelector {
     async fn start(&self);
     async fn contact_candidates(&self);
-    async fn ping_candidate(
-        &self,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    );
+    async fn ping_candidate(&self, pair: &CandidatePair);
     async fn handle_success_response(
         &self,
         m: &Message,
@@ -195,17 +187,15 @@ impl AgentInternal {
                         pair.local,
                         pair.remote
                     );
-                    let local = pair.local.clone();
-                    let remote = pair.remote.clone();
-                    Some((msg, local, remote))
+                    Some((msg, pair.clone()))
                 }
             } else {
                 None
             }
         };
 
-        if let Some((msg, local, remote)) = result {
-            self.send_binding_request(&msg, &local, &remote).await;
+        if let Some((msg, pair)) = result {
+            self.send_binding_request(&msg, &pair).await;
         }
     }
 
@@ -225,15 +215,11 @@ impl AgentInternal {
         }
     }
 
-    pub(crate) async fn ping_candidate(
-        &self,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
+    pub(crate) async fn ping_candidate(&self, pair: &CandidatePair) {
         if self.is_controlling.load(Ordering::SeqCst) {
-            ControllingSelector::ping_candidate(self, local, remote).await;
+            ControllingSelector::ping_candidate(self, pair).await;
         } else {
-            ControlledSelector::ping_candidate(self, local, remote).await;
+            ControlledSelector::ping_candidate(self, pair).await;
         }
     }
 
@@ -300,11 +286,7 @@ impl ControllingSelector for AgentInternal {
         }
     }
 
-    async fn ping_candidate(
-        &self,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
+    async fn ping_candidate(&self, pair: &CandidatePair) {
         let (msg, result) = {
             let ufrag_pwd = self.ufrag_pwd.lock().await;
             let username = ufrag_pwd.remote_ufrag.clone() + ":" + ufrag_pwd.local_ufrag.as_str();
@@ -314,7 +296,7 @@ impl ControllingSelector for AgentInternal {
                 Box::new(TransactionId::new()),
                 Box::new(Username::new(ATTR_USERNAME, username)),
                 Box::new(AttrControlling(self.tie_breaker.load(Ordering::SeqCst))),
-                Box::new(PriorityAttr(local.priority())),
+                Box::new(PriorityAttr(pair.local.priority())),
                 Box::new(MessageIntegrity::new_short_term_integrity(
                     ufrag_pwd.remote_pwd.clone(),
                 )),
@@ -326,7 +308,7 @@ impl ControllingSelector for AgentInternal {
         if let Err(err) = result {
             log::error!("{}", err);
         } else {
-            self.send_binding_request(&msg, local, remote).await;
+            self.send_binding_request(&msg, pair).await;
         }
     }
 
@@ -391,18 +373,19 @@ impl ControllingSelector for AgentInternal {
         local: &Arc<dyn Candidate + Send + Sync>,
         remote: &Arc<dyn Candidate + Send + Sync>,
     ) {
-        self.send_binding_success(m, local, remote).await;
-        log::trace!("controllingSelector: sendBindingSuccess");
-
-        if self.find_pair(local, remote).await.is_some() {
-            if self.agent_conn.get_selected_pair().is_none()
-                && self.nominated_pair.lock().await.is_none()
-            {
-                self.try_nominate_best().await;
-            }
-        } else {
-            log::trace!("controllingSelector: addPair");
-            self.add_pair(local.clone(), remote.clone()).await;
+        let known = self.find_pair(local, remote).await;
+        let pair_existed = known.is_some();
+        let pair = match known {
+            Some(pair) => pair,
+            None => self.add_pair(local.clone(), remote.clone()).await,
+        };
+        pair.check_io.lock().requests_received += 1;
+        self.send_binding_success(m, &pair).await;
+        if pair_existed
+            && self.agent_conn.get_selected_pair().is_none()
+            && self.nominated_pair.lock().await.is_none()
+        {
+            self.try_nominate_best().await;
         }
     }
 }
@@ -425,11 +408,7 @@ impl ControlledSelector for AgentInternal {
         }
     }
 
-    async fn ping_candidate(
-        &self,
-        local: &Arc<dyn Candidate + Send + Sync>,
-        remote: &Arc<dyn Candidate + Send + Sync>,
-    ) {
+    async fn ping_candidate(&self, pair: &CandidatePair) {
         let (msg, result) = {
             let ufrag_pwd = self.ufrag_pwd.lock().await;
             let username = ufrag_pwd.remote_ufrag.clone() + ":" + ufrag_pwd.local_ufrag.as_str();
@@ -439,7 +418,7 @@ impl ControlledSelector for AgentInternal {
                 Box::new(TransactionId::new()),
                 Box::new(Username::new(ATTR_USERNAME, username)),
                 Box::new(AttrControlled(self.tie_breaker.load(Ordering::SeqCst))),
-                Box::new(PriorityAttr(local.priority())),
+                Box::new(PriorityAttr(pair.local.priority())),
                 Box::new(MessageIntegrity::new_short_term_integrity(
                     ufrag_pwd.remote_pwd.clone(),
                 )),
@@ -451,7 +430,7 @@ impl ControlledSelector for AgentInternal {
         if let Err(err) = result {
             log::error!("{}", err);
         } else {
-            self.send_binding_request(&msg, local, remote).await;
+            self.send_binding_request(&msg, pair).await;
         }
     }
 
@@ -521,6 +500,7 @@ impl ControlledSelector for AgentInternal {
         }
 
         if let Some(p) = self.find_pair(local, remote).await {
+            p.check_io.lock().requests_received += 1;
             let use_candidate = m.contains(ATTR_USE_CANDIDATE);
             if use_candidate {
                 // https://tools.ietf.org/html/rfc8445#section-7.3.1.5
@@ -546,8 +526,8 @@ impl ControlledSelector for AgentInternal {
                 }
             }
 
-            self.send_binding_success(m, local, remote).await;
-            self.ping_candidate(local, remote).await;
+            self.send_binding_success(m, &p).await;
+            self.ping_candidate(&p).await;
         }
     }
 }
