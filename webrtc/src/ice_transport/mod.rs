@@ -121,6 +121,19 @@ impl RTCIceTransport {
             .collect()
     }
 
+    pub async fn timed_local_candidate(&self) -> Option<(String, std::net::SocketAddrV4)> {
+        let c = self.gatherer.get_agent().await?.timed_local_candidate().await?;
+        match c.addr() {
+            std::net::SocketAddr::V4(a) => Some((c.id(), a)),
+            _ => None,
+        }
+    }
+
+    pub async fn timed_first_check(&self, local_id: &str, remote_line: &str) -> bool {
+        let Some(agent) = self.gatherer.get_agent().await else { return false };
+        agent.timed_first_check(local_id, remote_line).await
+    }
+
     /// Wake the standard connectivity checklist when a live peer has signalled readiness.
     pub async fn request_connectivity_check(&self) -> bool {
         match self.gatherer.get_agent().await {

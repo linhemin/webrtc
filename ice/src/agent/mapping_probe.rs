@@ -392,7 +392,7 @@ impl Agent {
             .unwrap_or_default()
     }
 
-    async fn collect_mappings(self: &Arc<Self>) -> Result<Measurement, ()> {
+    async fn public_udp_sockets(&self) -> Vec<Local> {
         let deadline = Instant::now() + Duration::from_millis(650);
         let mut locals;
         loop {
@@ -409,10 +409,6 @@ impl Agent {
                 break;
             }
             sleep(Duration::from_millis(40)).await;
-        }
-        // Do not cache a missing candidate during trickle gathering. A later call can retry.
-        if locals.is_empty() {
-            return Err(());
         }
         {
             let physical = self.internal.mapping_probes.physical.lock();
@@ -431,6 +427,52 @@ impl Agent {
                 }
             });
         }
+        locals
+    }
+
+    pub async fn timed_local_candidate(&self) -> Option<Local> {
+        let sockets = self.public_udp_sockets().await;
+        if self.interface_stun_provider.is_some() {
+            let physical = self.internal.mapping_probes.physical.lock();
+            return sockets.into_iter().find(|c| physical.iter().any(|p| p.ptr_eq(&Arc::downgrade(c))));
+        }
+        sockets.into_iter().next()
+    }
+
+    /// The caller withholds remote trickle until this one-shot check. Use the normal
+    /// signed Binding request, transaction table and existing candidate receive loop.
+    pub async fn timed_first_check(&self, local_id: &str, remote_line: &str) -> bool {
+        if self.get_selected_candidate_pair().is_some() || remote_line.len() > 2048 {
+            return false;
+        }
+        let Ok(remote) = crate::candidate::candidate_base::unmarshal_candidate(remote_line) else {
+            return false;
+        };
+        if remote.network_type() != NetworkType::Udp4 || remote.component() != 1
+            || remote.candidate_type() != CandidateType::ServerReflexive
+            || !matches!(remote.addr(), SocketAddr::V4(a) if a.port() != 0 && globally_reachable_ipv4(*a.ip())) {
+            return false;
+        }
+        let local = self.internal.local_candidates.lock().await.get(&NetworkType::Udp4)
+            .and_then(|v| v.iter().find(|c| c.id() == local_id && c.candidate_type() == CandidateType::ServerReflexive)).cloned();
+        let Some(local) = local else { return false };
+        {
+            let credentials = self.internal.ufrag_pwd.lock().await;
+            if credentials.remote_ufrag.is_empty() || credentials.remote_pwd.is_empty() {
+                return false;
+            }
+        }
+        let pair = crate::candidate::CandidatePair::new(local, Arc::new(remote),
+            self.internal.is_controlling.load(Ordering::SeqCst));
+        self.internal.ping_candidate(&pair).await;
+        let written = pair.check_io.lock().requests_sent != 0;
+        written
+    }
+
+    async fn collect_mappings(self: &Arc<Self>) -> Result<Measurement, ()> {
+        let locals = self.public_udp_sockets().await;
+        // Do not cache a missing candidate during trickle gathering. A later call can retry.
+        if locals.is_empty() { return Err(()); }
         let mut work = JoinSet::new();
         for candidate in locals.into_iter().take(MAX_SOCKETS) {
             let agent = self.clone();
