@@ -27,6 +27,7 @@ use crate::stats::StatsReportType::Transport;
 #[cfg(test)]
 mod ice_transport_test;
 
+mod gateway_candidate;
 pub mod ice_candidate;
 pub mod ice_candidate_pair;
 pub mod ice_candidate_type;
@@ -105,6 +106,19 @@ impl RTCIceTransport {
 
     pub async fn udp_mapping_stats(&self) -> Option<ice::agent::mapping_probe::MappingProbeStats> {
         self.gatherer.get_agent().await?.udp_mapping_stats()
+    }
+
+    /// Measured public UDP endpoints on existing candidate sockets for authenticated trickle.
+    pub async fn observed_udp_candidates(&self) -> Vec<RTCIceCandidate> {
+        let Some(agent) = self.gatherer.get_agent().await else {
+            return Vec::new();
+        };
+        agent
+            .observed_udp_candidates()
+            .await
+            .iter()
+            .map(RTCIceCandidate::from)
+            .collect()
     }
 
     /// Wake the standard connectivity checklist when a live peer has signalled readiness.

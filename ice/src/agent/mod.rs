@@ -19,6 +19,7 @@ pub mod agent_stats;
 pub mod agent_transport;
 pub mod socket_diagnostics;
 pub mod mapping_probe;
+mod gateway_candidate;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -116,6 +117,7 @@ pub struct Agent {
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
     pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
+    gateway_attempt: Mutex<Option<(String, String)>>,
     pub(crate) mdns_mode: MulticastDnsMode,
     pub(crate) mdns_name: String,
     pub(crate) mdns_conn: Option<Arc<DnsConn>>,
@@ -220,6 +222,7 @@ impl Agent {
             ip_filter: Arc::clone(&config.ip_filter),
             gather_interface_srflx: config.gather_interface_srflx,
             interface_stun_provider: config.interface_stun_provider.clone(),
+            gateway_attempt: Mutex::new(None),
             mdns_mode,
             mdns_name,
             mdns_conn,

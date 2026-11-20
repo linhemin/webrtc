@@ -62,6 +62,18 @@ pub type IpFilterFn = Box<dyn (Fn(IpAddr) -> bool) + Send + Sync>;
 pub trait InterfaceStunProvider: Send + Sync {
     fn supports_source(&self, source: Ipv4Addr) -> bool;
 
+    /// Lease one port on an application-owned socket for this peer IPv4 only.
+    /// The socket owns the lease and removes it on close. Unsupported gateways
+    /// decline; the provider must not silently request an unrestricted mapping.
+    async fn bind_mapped_peer(
+        &self,
+        _peer: Ipv4Addr,
+        _local_port_min: u16,
+        _local_port_max: u16,
+    ) -> Option<(Arc<dyn util::Conn + Send + Sync>, std::net::SocketAddrV4)> {
+        None
+    }
+
     /// Resolve a configured STUN observer using the same DNS policy as the bound socket.
     /// An unavailable observer leaves a cross-destination measurement inconclusive.
     async fn resolve_for_socket(
