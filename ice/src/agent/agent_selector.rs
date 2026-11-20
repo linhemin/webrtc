@@ -551,12 +551,17 @@ impl ControlledSelector for AgentInternal {
             if use_candidate {
                 // https://tools.ietf.org/html/rfc8445#section-7.3.1.5
 
-                if p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8 {
+                if self.lite.load(Ordering::SeqCst)
+                    || p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8
+                {
                     // If the state of this pair is Succeeded, it means that the check
                     // previously sent by this pair produced a successful response and
                     // generated a valid pair (Section 7.2.5.3.2).  The agent sets the
                     // nominated flag value of the valid pair to true.
                     if self.agent_conn.get_selected_pair().is_none() {
+                        // A lite agent accepts its full peer's authenticated nomination (7.3.2).
+                        p.state
+                            .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
                         self.set_selected_pair(Some(Arc::clone(&p))).await;
                     }
                 } else {
