@@ -242,6 +242,7 @@ pub struct CandidatePair {
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct CheckIo {
+    pub(crate) last_triggered: Option<tokio::time::Instant>,
     pub(crate) requests_sent: u64,
     pub(crate) request_send_failures: u64,
     pub(crate) requests_received: u64,

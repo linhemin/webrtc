@@ -15,11 +15,19 @@ async fn endpoint() -> Arc<UdpSocket> {
 
 fn installed_socket(socket: Arc<dyn util::Conn + Send + Sync>) -> Local {
     let addr = socket.local_addr().unwrap();
+    installed_at(
+        socket,
+        SocketAddr::new("8.8.4.4".parse().unwrap(), addr.port()),
+    )
+}
+
+fn installed_at(socket: Arc<dyn util::Conn + Send + Sync>, advertised: SocketAddr) -> Local {
+    let addr = socket.local_addr().unwrap();
     Arc::new(
         CandidateServerReflexiveConfig {
             base_config: CandidateBaseConfig {
-                address: "8.8.4.4".into(),
-                port: addr.port(),
+                address: advertised.ip().to_string(),
+                port: advertised.port(),
                 network: "udp".into(),
                 component: 1,
                 conn: Some(socket),
@@ -275,7 +283,8 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         .bind(format!("{public}:3478").parse().unwrap())
         .await
         .unwrap();
-    let source: SocketAddr = "1.1.1.1:45000".parse().unwrap();
+    let original: SocketAddr = "1.1.1.1:45000".parse().unwrap();
+    let source: SocketAddr = "1.1.1.1:45223".parse().unwrap();
     let socket = client.bind(source).await.unwrap();
     let agent = Arc::new(
         Agent::new(AgentConfig {
@@ -286,9 +295,32 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         .await
         .unwrap(),
     );
-    agent.internal.started_ch_tx.lock().await.take();
-    let cand = installed_socket(socket);
+    let cand = installed_at(socket, original);
     agent.internal.add_candidate(&cand).await.unwrap();
+    // Only the alternate observer reports the reachable address. The original
+    // published port is unbound and the first agent knows no endpoint for its peer.
+    let peer = Arc::new(
+        Agent::new(AgentConfig {
+            net: Some(server.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    );
+    let peer_addr: SocketAddr = "8.8.4.4:46000".parse().unwrap();
+    let peer_local = installed_at(server.bind(peer_addr).await.unwrap(), peer_addr);
+    peer.internal.add_candidate(&peer_local).await.unwrap();
+    let signaled: Local =
+        Arc::new(crate::candidate::candidate_base::unmarshal_candidate(&cand.marshal()).unwrap());
+    peer.add_remote_candidate(&signaled).unwrap();
+    let (a_user, a_pwd) = agent.get_local_user_credentials().await;
+    let (b_user, b_pwd) = peer.get_local_user_credentials().await;
+    let (_tx_a, rx_a) = tokio::sync::mpsc::channel(1);
+    let (_tx_b, rx_b) = tokio::sync::mpsc::channel(1);
+    let a = agent.clone();
+    let b = peer.clone();
+    let a_task = tokio::spawn(async move { a.dial(rx_a, b_user, b_pwd).await });
+    let b_task = tokio::spawn(async move { b.accept(rx_b, a_user, a_pwd).await });
     agent.gathering_state.store(
         super::super::GatheringState::Complete as u8,
         Ordering::SeqCst,
@@ -340,8 +372,42 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
     );
     assert_eq!(other, stats);
     assert_eq!(agent.udp_mapping_stats(), Some(stats));
+    assert!(agent.get_selected_candidate_pair().is_none());
+    assert!(peer.get_selected_candidate_pair().is_none());
+    let alternates = agent.observed_udp_candidates().await;
+    assert_eq!(alternates.len(), 1);
+    assert_eq!(alternates[0].addr(), source);
+    assert!(alternates[0].get_conn().is_none());
+    let trickled: Local = Arc::new(
+        crate::candidate::candidate_base::unmarshal_candidate(&alternates[0].marshal()).unwrap(),
+    );
+    peer.add_remote_candidate(&trickled).unwrap();
+    use util::Conn;
+    timeout(Duration::from_secs(6), async {
+        let a = a_task.await.unwrap().unwrap();
+        let b = b_task.await.unwrap().unwrap();
+        let p = agent.get_selected_candidate_pair().unwrap();
+        assert_eq!(p.local.id(), cand.id());
+        assert_eq!(p.remote.candidate_type(), CandidateType::PeerReflexive);
+        assert_eq!(
+            peer.get_selected_candidate_pair().unwrap().remote.addr(),
+            source
+        );
+        let mut buf = [0; 32];
+        a.send(b"from original socket").await.unwrap();
+        let n = b.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"from original socket");
+        b.send(b"to observed port").await.unwrap();
+        let n = a.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"to observed port");
+    })
+    .await
+    .unwrap();
+    assert_eq!(agent.udp_socket_diagnostics().unwrap().candidate_readers, 1);
     agent.restart(String::new(), String::new()).await.unwrap();
     assert!(agent.udp_mapping_stats().is_none());
+    assert!(agent.observed_udp_candidates().await.is_empty());
     agent.close().await.unwrap();
+    peer.close().await.unwrap();
     router.lock().await.stop().await.unwrap();
 }

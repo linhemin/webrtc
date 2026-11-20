@@ -92,11 +92,8 @@ async fn check_io_counts_only_authenticated_requests_and_matched_socket_writes()
             .await
             .unwrap();
         assert_eq!(remote.candidate_type(), CandidateType::PeerReflexive);
-        let pair = a.find_pair(&local, &remote).await.unwrap();
-        if controlling {
-            a.ping_candidate(&pair).await;
-        }
-        // Controlled already issued its triggered check. The peer must receive both
+        assert!(a.find_pair(&local, &remote).await.is_some());
+        // Both roles issue a triggered check. The peer must receive both
         // datagrams from the same local UDP endpoint that was charged for the write.
         let mut req_id = None;
         for _ in 0..2 {
@@ -201,6 +198,73 @@ async fn check_io_no_candidate_socket_does_not_count_datagrams_as_sent() -> Resu
         (1, 1, 1)
     );
     agent.close().await
+}
+
+#[tokio::test]
+async fn authenticated_check_reopens_only_its_failed_pair_and_paces_duplicate_triggers(
+) -> Result<()> {
+    use tokio::net::UdpSocket;
+    for controlling in [true, false] {
+        let agent = Agent::new(AgentConfig {
+            is_controlling: controlling,
+            ..Default::default()
+        })
+        .await?;
+        let a = &agent.internal;
+        let first = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let local = host(first.local_addr()?, Some(first))?;
+        let second = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let unrelated = host(second.local_addr()?, Some(second))?;
+        a.add_candidate(&local).await?;
+        a.add_candidate(&unrelated).await?;
+        let peer = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = peer.local_addr()?;
+        let (username, password) = {
+            let mut creds = a.ufrag_pwd.lock().await;
+            creds.remote_pwd = "peer-test-password".into();
+            (
+                format!("{}:{}", creds.local_ufrag, creds.remote_ufrag),
+                creds.local_pwd.clone(),
+            )
+        };
+        let mut request = incoming_check(&username, &password)?;
+        a.handle_inbound(&mut request, &local, addr).await;
+        let remote = a
+            .find_remote_candidate(local.network_type(), addr)
+            .await
+            .unwrap();
+        let pair = a.find_pair(&local, &remote).await.unwrap();
+        assert!(a.find_pair(&unrelated, &remote).await.is_none());
+        // The ordinary retry budget expired before the authentic peer packet arrived.
+        pair.check_io.lock().last_triggered = None;
+        pair.state
+            .store(CandidatePairState::Failed as u8, Ordering::SeqCst);
+        pair.binding_request_count.store(100, Ordering::SeqCst);
+        let pre = pair.check_io.lock().requests_sent;
+        a.handle_inbound(
+            &mut incoming_check(&username, "wrong-password")?,
+            &local,
+            addr,
+        )
+        .await;
+        assert_eq!(
+            CandidatePairState::from(pair.state.load(Ordering::SeqCst)),
+            CandidatePairState::Failed
+        );
+        for _ in 0..2 {
+            a.handle_inbound(&mut incoming_check(&username, &password)?, &local, addr)
+                .await;
+        }
+        assert_eq!(
+            CandidatePairState::from(pair.state.load(Ordering::SeqCst)),
+            CandidatePairState::InProgress
+        );
+        assert_eq!(pair.binding_request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(pair.check_io.lock().requests_sent, pre + 1);
+        assert_eq!(pair.check_io.lock().responses_sent, 3);
+        agent.close().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

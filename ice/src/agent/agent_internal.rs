@@ -508,27 +508,22 @@ impl AgentInternal {
         let _ = self.force_candidate_contact_tx.try_send(true);
     }
 
-    /// Assumes you are holding the lock (must be execute using a.run).
-    pub(crate) async fn add_remote_candidate(&self, c: &Arc<dyn Candidate + Send + Sync>) {
+    async fn remember_remote_candidate(&self, c: &Arc<dyn Candidate + Send + Sync>) -> bool {
         let network_type = c.network_type();
-
-        {
-            let mut remote_candidates = self.remote_candidates.lock().await;
-            if let Some(cands) = remote_candidates.get(&network_type) {
-                for cand in cands {
-                    if cand.equal(&**c) {
-                        return;
-                    }
-                }
-            }
-
-            if let Some(cands) = remote_candidates.get_mut(&network_type) {
-                cands.push(c.clone());
-            } else {
-                remote_candidates.insert(network_type, vec![c.clone()]);
-            }
+        let mut remotes = self.remote_candidates.lock().await;
+        let candidates = remotes.entry(network_type).or_default();
+        if candidates.iter().any(|existing| existing.equal(&**c)) {
+            return false;
         }
+        candidates.push(c.clone());
+        true
+    }
 
+    pub(crate) async fn add_remote_candidate(&self, c: &Arc<dyn Candidate + Send + Sync>) {
+        if !self.remember_remote_candidate(c).await {
+            return;
+        }
+        let network_type = c.network_type();
         let mut local_cands = vec![];
         {
             let local_candidates = self.local_candidates.lock().await;
@@ -598,7 +593,11 @@ impl AgentInternal {
         }
 
         for cand in remote_cands {
-            self.add_pair(c.clone(), cand).await;
+            // A peer-reflexive address was learned on a specific receiving socket.
+            // Other sockets only pair with it if they, too, receive an authenticated check.
+            if cand.candidate_type() != CandidateType::PeerReflexive {
+                self.add_pair(c.clone(), cand).await;
+            }
         }
 
         self.request_connectivity_check();
@@ -941,14 +940,16 @@ impl AgentInternal {
             }
 
             if remote_candidate.is_none() {
-                let (ip, port, network_type) = (remote.ip(), remote.port(), NetworkType::Udp4);
+                let mut priority = crate::priority::PriorityAttr::default();
+                let _ = priority.get_from(m);
 
                 let prflx_candidate_config = CandidatePeerReflexiveConfig {
                     base_config: CandidateBaseConfig {
-                        network: network_type.to_string(),
-                        address: ip.to_string(),
-                        port,
+                        network: local.network_type().to_string(),
+                        address: remote.ip().to_string(),
+                        port: remote.port(),
                         component: local.component(),
+                        priority: priority.0,
                         ..CandidateBaseConfig::default()
                     },
                     rel_addr: "".to_owned(),
@@ -974,7 +975,9 @@ impl AgentInternal {
                     remote
                 );
                 if let Some(rc) = &remote_candidate {
-                    self.add_remote_candidate(rc).await;
+                    // RFC 8445 7.3.1.3-4: pair this learned address with the exact socket
+                    // that accepted the authenticated request. The selector creates that pair.
+                    self.remember_remote_candidate(rc).await;
                 }
             }
 

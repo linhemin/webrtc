@@ -58,6 +58,39 @@ trait ControlledSelector {
 }
 
 impl AgentInternal {
+    // RFC 8445 7.3.1.4: an authenticated inbound check is evidence for the exact
+    // receiving socket and source, even when previous ordinary checks exhausted their budget.
+    async fn trigger_return_check(&self, pair: &CandidatePair) {
+        if self.lite.load(Ordering::SeqCst) || self.agent_conn.get_selected_pair().is_some() {
+            return;
+        }
+        {
+            let mut io = pair.check_io.lock();
+            let state = CandidatePairState::from(pair.state.load(Ordering::SeqCst));
+            let now = Instant::now();
+            if state == CandidatePairState::Succeeded
+                || io
+                    .last_triggered
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(200))
+            {
+                return;
+            }
+            io.last_triggered = Some(now);
+            // A late authenticated request reopens only this pair. The ordinary checklist
+            // keeps its normal retry limits; no check is sent to other speculative endpoints.
+            if state == CandidatePairState::Failed {
+                pair.binding_request_count.store(0, Ordering::SeqCst);
+                let _ = pair.state.compare_exchange(
+                    CandidatePairState::Failed as u8,
+                    CandidatePairState::InProgress as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        self.ping_candidate(pair).await;
+    }
+
     fn is_nominatable(&self, c: &Arc<dyn Candidate + Send + Sync>) -> bool {
         let start_time = *self.start_time.lock();
         match c.candidate_type() {
@@ -387,6 +420,7 @@ impl ControllingSelector for AgentInternal {
         self.socket_rx.direct(local, |c| &c.req_accepted);
         pair.check_io.lock().requests_received += 1;
         self.send_binding_success(m, &pair).await;
+        self.trigger_return_check(&pair).await;
         if pair_existed
             && self.agent_conn.get_selected_pair().is_none()
             && self.nominated_pair.lock().await.is_none()
@@ -539,7 +573,7 @@ impl ControlledSelector for AgentInternal {
             }
 
             self.send_binding_success(m, &p).await;
-            self.ping_candidate(&p).await;
+            self.trigger_return_check(&p).await;
         } else {
             self.socket_rx.direct(local, |c| &c.req_candidate_failed);
         }

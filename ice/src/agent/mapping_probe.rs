@@ -1,6 +1,6 @@
 //! Opt-in comparison of public mappings on sockets already installed in the ICE checklist.
 //! The existing candidate receive loop owns recv_from throughout the measurement.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,13 +18,19 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 use util::sync::Mutex;
 
 use super::Agent;
-use crate::candidate::{Candidate, CandidatePairState, CandidateType};
+use crate::candidate::{
+    candidate_base::CandidateBaseConfig,
+    candidate_server_reflexive::CandidateServerReflexiveConfig, Candidate, CandidatePairState,
+    CandidateType,
+};
 use crate::network_type::NetworkType;
 use crate::url::{ProtoType, SchemeType, Url};
 use crate::util::globally_reachable_ipv4;
 
 type Local = Arc<dyn Candidate + Send + Sync>;
 const MAX_SOCKETS: usize = 6;
+const MAX_SIGNALED_MAPPINGS: usize = 6;
+const MAX_MAPPINGS_PER_SOCKET: usize = 2;
 const MAX_OBSERVERS: usize = 4;
 const REPLY_WAIT: Duration = Duration::from_millis(810);
 const RETRY_AFTER: Duration = Duration::from_millis(350);
@@ -60,7 +66,14 @@ pub(crate) struct Probes {
     physical: Mutex<Vec<Weak<dyn Candidate + Send + Sync>>>,
     active: AtomicBool,
     pending: Mutex<HashMap<TransactionId, Pending>>,
-    epoch: Mutex<Arc<OnceCell<MappingProbeStats>>>,
+    epoch: Mutex<Arc<OnceCell<Measurement>>>,
+}
+
+#[derive(Default)]
+struct Measurement {
+    stats: MappingProbeStats,
+    // Kept only in this ICE generation. The diagnostic payload contains counts only.
+    alternates: Vec<(Weak<dyn Candidate + Send + Sync>, Vec<SocketAddrV4>)>,
 }
 
 impl Probes {
@@ -307,7 +320,64 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr]) -> Sa
 
 impl Agent {
     pub fn udp_mapping_stats(&self) -> Option<MappingProbeStats> {
-        self.internal.mapping_probes.epoch.lock().get().copied()
+        self.internal
+            .mapping_probes
+            .epoch
+            .lock()
+            .get()
+            .map(|m| m.stats)
+    }
+
+    /// Return additional *signaling* candidates derived from responses on a still-installed
+    /// socket. Only ports on that socket's already signaled public IP are eligible. The owning
+    /// candidate keeps its original reader and handles the peer checks and data.
+    pub async fn observed_udp_candidates(&self) -> Vec<Local> {
+        let epoch = self.internal.mapping_probes.epoch.lock().clone();
+        let Some(measurement) = epoch.get() else {
+            return Vec::new();
+        };
+        let locals = self.internal.local_candidates.lock().await;
+        let Some(installed) = locals.get(&NetworkType::Udp4) else {
+            return Vec::new();
+        };
+        let mut seen: HashSet<_> = installed.iter().map(|c| c.addr()).collect();
+        let mut out: Vec<Local> = Vec::new();
+        // Offer one port per socket before considering a second port on the same socket.
+        for round in 0..MAX_MAPPINGS_PER_SOCKET {
+            for (owner, ports) in &measurement.alternates {
+                let (Some(owner), Some(&addr)) = (owner.upgrade(), ports.get(round)) else {
+                    continue;
+                };
+                if !installed.iter().any(|c| Arc::ptr_eq(c, &owner))
+                    || !seen.insert(SocketAddr::V4(addr))
+                {
+                    continue;
+                }
+                let Some(related) = owner.related_address() else {
+                    continue;
+                };
+                let config = CandidateServerReflexiveConfig {
+                    base_config: CandidateBaseConfig {
+                        network: "udp".into(),
+                        address: addr.ip().to_string(),
+                        port: addr.port(),
+                        component: owner.component(),
+                        // Retain the base socket's component and reduce its local preference.
+                        priority: owner.priority().saturating_sub(256),
+                        ..Default::default()
+                    },
+                    rel_addr: related.address,
+                    rel_port: related.port,
+                };
+                if let Ok(candidate) = config.new_candidate_server_reflexive() {
+                    out.push(Arc::new(candidate));
+                    if out.len() == MAX_SIGNALED_MAPPINGS {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Uses configured STUN servers and exclusively existing, published IPv4 srflx sockets.
@@ -318,11 +388,11 @@ impl Agent {
         epoch
             .get_or_try_init(|| self.collect_mappings())
             .await
-            .copied()
+            .map(|m| m.stats)
             .unwrap_or_default()
     }
 
-    async fn collect_mappings(self: &Arc<Self>) -> Result<MappingProbeStats, ()> {
+    async fn collect_mappings(self: &Arc<Self>) -> Result<Measurement, ()> {
         let deadline = Instant::now() + Duration::from_millis(650);
         let mut locals;
         loop {
@@ -366,23 +436,43 @@ impl Agent {
             let agent = self.clone();
             work.spawn(async move {
                 let endpoints = agent.observers(&candidate).await;
-                sample(&agent.internal.mapping_probes, &candidate, &endpoints).await
+                let sample = sample(&agent.internal.mapping_probes, &candidate, &endpoints).await;
+                (candidate, sample)
             });
         }
         let total = work.len() as u32;
-        let mut stats = MappingProbeStats::default();
+        let mut measurement = Measurement::default();
         // Dropping the JoinSet aborts stalled resolution/sends without retaining the sockets.
         let _ = timeout(Duration::from_secs(3), async {
             while let Some(result) = work.join_next().await {
-                if let Ok(sample) = result {
-                    sample.record(&mut stats);
+                if let Ok((candidate, sample)) = result {
+                    sample.record(&mut measurement.stats);
+                    let base = candidate.addr();
+                    let mut alternates = Vec::new();
+                    // The final observation, when present, is the alternate-port test.
+                    for addr in sample.mappings.into_iter().rev() {
+                        if IpAddr::V4(*addr.ip()) == base.ip()
+                            && addr.port() != base.port()
+                            && !alternates.contains(&addr)
+                        {
+                            alternates.push(addr);
+                            if alternates.len() == MAX_MAPPINGS_PER_SOCKET {
+                                break;
+                            }
+                        }
+                    }
+                    if !alternates.is_empty() {
+                        measurement
+                            .alternates
+                            .push((Arc::downgrade(&candidate), alternates));
+                    }
                 }
             }
         })
         .await;
-        stats.inconclusive += total - stats.sockets;
-        stats.sockets = total;
-        Ok(stats)
+        measurement.stats.inconclusive += total - measurement.stats.sockets;
+        measurement.stats.sockets = total;
+        Ok(measurement)
     }
 
     async fn observers(&self, socket: &Local) -> Vec<SocketAddr> {
@@ -483,7 +573,7 @@ impl Agent {
         {
             return false;
         }
-        self.internal.request_connectivity_check();
+        self.internal.wake_synchronized_check();
         true
     }
 }
