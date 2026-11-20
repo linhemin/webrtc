@@ -78,6 +78,7 @@ pub(crate) struct Probes {
 struct Measurement {
     stats: MappingProbeStats,
     ranks: HashMap<String, u8>,
+    corroborated_bases: HashSet<String>,
     // Kept only in this ICE generation. The diagnostic payload contains counts only.
     alternates: Vec<(Weak<dyn Candidate + Send + Sync>, Vec<SocketAddrV4>)>,
 }
@@ -257,6 +258,7 @@ struct Sample {
     mappings: Vec<SocketAddrV4>,
     alternate_changed: Option<bool>,
     ordered_profile: Option<usize>,
+    base_corroborated: bool,
 }
 
 impl Sample {
@@ -355,6 +357,14 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
         }
     }
     if ordered {
+        // Endpoint-dependent mappings can still preserve the gathered address
+        // at several independent destinations. A second port on the same
+        // observer cannot by itself corroborate that address.
+        result.base_corroborated = live.iter()
+            .filter(|(_, mapped)| SocketAddr::V4(*mapped) == socket.addr())
+            .map(|(target, _)| target.ip())
+            .collect::<HashSet<_>>()
+            .len() >= 2;
         let series: Vec<_> = live.into_iter().map(|(_, mapped)| mapped).collect();
         result.ordered_profile = Some(observed_profile(&series));
     }
@@ -505,7 +515,8 @@ impl Agent {
                     SocketAddr::V4(addr) => Some(addr),
                     _ => None,
                 });
-            let endpoint = if !selected.is_empty() && rank == 2 {
+            let corroborated = epoch.get().map_or(false, |m| m.corroborated_bases.contains(&id));
+            let endpoint = if !selected.is_empty() && rank == 2 && !corroborated {
                 alias.unwrap_or(base)
             } else {
                 base
@@ -589,6 +600,9 @@ impl Agent {
                         2 // at least one observation disagrees with the advertised endpoint
                     };
                     measurement.ranks.insert(candidate.id(), rank);
+                    if sample.base_corroborated {
+                        measurement.corroborated_bases.insert(candidate.id());
+                    }
                     let mut alternates = Vec::new();
                     // The final observation, when present, is the alternate-port test.
                     for addr in sample.mappings.into_iter().rev() {

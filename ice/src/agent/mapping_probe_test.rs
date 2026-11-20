@@ -248,6 +248,15 @@ async fn wake_only_installed_unsatisfied_direct_pairs_with_credentials() {
 
 #[tokio::test]
 async fn authenticated_socket_measurement_tests_change_port_and_caches_per_generation() {
+    exercise_alternate_mapping(false).await;
+}
+
+#[tokio::test]
+async fn base_confirmed_by_two_observer_ips_is_retained_alongside_a_trickled_alias() {
+    exercise_alternate_mapping(true).await;
+}
+
+async fn exercise_alternate_mapping(independent_observer: bool) {
     // Entirely isolated router: exercise the real Agent API and RFC 5780 source-port switch
     // using public-shaped addresses without sending network traffic to Internet servers.
     use crate::agent::agent_vnet_test::connect_net2router;
@@ -271,7 +280,11 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         static_ips: vec!["1.1.1.1".into()],
         ..Default::default()
     })));
-    for net in [&server, &client] {
+    let other = Arc::new(Net::new(Some(NetConfig {
+        static_ips: vec!["8.8.8.8".into()],
+        ..Default::default()
+    })));
+    for net in [&server, &client, &other] {
         connect_net2router(net, &router).await.unwrap();
     }
     router.lock().await.start().await.unwrap();
@@ -283,7 +296,8 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         .bind(format!("{public}:3478").parse().unwrap())
         .await
         .unwrap();
-    let ordinary = server.bind(format!("{public}:3479").parse().unwrap()).await.unwrap();
+    let (ordinary_net, ordinary_ip) = if independent_observer { (&other, "8.8.8.8") } else { (&server, public) };
+    let ordinary = ordinary_net.bind(format!("{ordinary_ip}:3479").parse().unwrap()).await.unwrap();
     let original: SocketAddr = "1.1.1.1:45000".parse().unwrap();
     let source: SocketAddr = "1.1.1.1:45223".parse().unwrap();
     let socket = client.bind(source).await.unwrap();
@@ -292,7 +306,7 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
             net: Some(client.clone()),
             urls: vec![
                 Url::parse_url("stun:8.8.4.4:443").unwrap(),
-                Url::parse_url("stun:8.8.4.4:3479").unwrap(),
+                Url::parse_url(&format!("stun:{ordinary_ip}:3479")).unwrap(),
             ],
             grouped_physical_stun: true,
             ..Default::default()
@@ -400,7 +414,7 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
     assert_eq!(group.len(), 2);
     assert_eq!(group[0].1, stable);
     assert_eq!(group[1].0, cand.id());
-    assert_eq!(SocketAddr::V4(group[1].1), source);
+    assert_eq!(SocketAddr::V4(group[1].1), if independent_observer { original } else { source });
     let trickled: Local = Arc::new(
         crate::candidate::candidate_base::unmarshal_candidate(&alternates[0].marshal()).unwrap(),
     );
