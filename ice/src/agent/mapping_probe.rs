@@ -302,10 +302,6 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
                 .await.ok().flatten();
             replies.push(reply);
         }
-        // Only live observations taken in send order count. A cached gather mapping
-        // can still be advertised but cannot establish the order of allocations.
-        let series = replies.iter().flatten().map(|r| r.mapped).collect::<Vec<_>>();
-        result.ordered_profile = Some(observed_profile(&series));
         replies
     } else {
         join_all(endpoints.iter().map(|&ep| probes.query(socket, ep, ep, false))).await
@@ -318,6 +314,9 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
         .zip(replies)
         .filter_map(|(ep, obs)| obs.map(|o| (ep, o)))
         .collect();
+    // Classify only live queries to distinct destinations in send order.
+    // The cached gather mapping does not establish its allocation order.
+    let mut live: Vec<_> = observations.iter().map(|(ep, obs)| (*ep, obs.mapped)).collect();
     if let Some((ep, cached)) = gathered {
         if !observations.iter().any(|(target, _)| *target == ep) {
             observations.push((ep, cached));
@@ -340,11 +339,20 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
             probes.query(socket, alt, alt, false).await
         };
         if let Ok(Some(other)) = timeout(Duration::from_millis(1450), exchange).await {
+            // This reply matched the direct query to alt. The CHANGE-PORT
+            // request went to the primary and is never a second destination.
+            if ordered && !live.iter().any(|(ep, _)| *ep == alt) {
+                live.push((alt, other.mapped));
+            }
             result.alternate_changed = Some(other.mapped != baseline);
             if !observed_targets.contains(&alt) {
                 result.mappings.push(other.mapped);
             }
         }
+    }
+    if ordered {
+        let series: Vec<_> = live.into_iter().map(|(_, mapped)| mapped).collect();
+        result.ordered_profile = Some(observed_profile(&series));
     }
     result
 }
@@ -363,6 +371,10 @@ impl Agent {
     /// socket. Only ports on that socket's already signaled public IP are eligible. The owning
     /// candidate keeps its original reader and handles the peer checks and data.
     pub async fn observed_udp_candidates(&self) -> Vec<Local> {
+        self.observed_udp_aliases().await.into_iter().map(|(_, alias)| alias).collect()
+    }
+
+    async fn observed_udp_aliases(&self) -> Vec<(String, Local)> {
         let epoch = self.internal.mapping_probes.epoch.lock().clone();
         let Some(measurement) = epoch.get() else {
             return Vec::new();
@@ -372,7 +384,7 @@ impl Agent {
             return Vec::new();
         };
         let mut seen: HashSet<_> = installed.iter().map(|c| c.addr()).collect();
-        let mut out: Vec<Local> = Vec::new();
+        let mut out: Vec<(String, Local)> = Vec::new();
         // Offer one port per socket before considering a second port on the same socket.
         for round in 0..MAX_MAPPINGS_PER_SOCKET {
             for (owner, ports) in &measurement.alternates {
@@ -401,7 +413,7 @@ impl Agent {
                     rel_port: related.port,
                 };
                 if let Ok(candidate) = config.new_candidate_server_reflexive() {
-                    out.push(Arc::new(candidate));
+                    out.push((owner.id(), Arc::new(candidate)));
                     if out.len() == MAX_SIGNALED_MAPPINGS {
                         return out;
                     }
@@ -465,6 +477,7 @@ impl Agent {
         self.measure_udp_mappings().await;
         let epoch = self.internal.mapping_probes.epoch.lock().clone();
         let sockets = self.public_udp_sockets().await;
+        let aliases = self.observed_udp_aliases().await;
         let physical = self.internal.mapping_probes.physical.lock();
         let mut ranked = Vec::new();
         for socket in sockets {
@@ -479,9 +492,28 @@ impl Agent {
         }
         ranked.sort_by_key(|(_, _, rank)| *rank);
         let mut seen = HashSet::new();
-        ranked.retain(|(_, endpoint, _)| seen.insert(*endpoint));
-        ranked.truncate(3);
-        ranked
+        let mut selected = Vec::new();
+        for (id, base, rank) in ranked {
+            // Retain the first gathered mapping. Alternate observations can be
+            // destination-specific even when every check to a different observer succeeded.
+            let alias = aliases.iter().find(|(owner, _)| *owner == id)
+                .and_then(|(_, c)| match c.addr() {
+                    SocketAddr::V4(addr) => Some(addr),
+                    _ => None,
+                });
+            let endpoint = if !selected.is_empty() && rank == 2 {
+                alias.unwrap_or(base)
+            } else {
+                base
+            };
+            if seen.insert(endpoint) {
+                selected.push((id, endpoint, rank));
+            }
+            if selected.len() == 3 {
+                break;
+            }
+        }
+        selected
     }
 
     pub async fn timed_local_candidate(&self) -> Option<Local> {

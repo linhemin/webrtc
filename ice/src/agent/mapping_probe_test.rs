@@ -283,13 +283,18 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         .bind(format!("{public}:3478").parse().unwrap())
         .await
         .unwrap();
+    let ordinary = server.bind(format!("{public}:3479").parse().unwrap()).await.unwrap();
     let original: SocketAddr = "1.1.1.1:45000".parse().unwrap();
     let source: SocketAddr = "1.1.1.1:45223".parse().unwrap();
     let socket = client.bind(source).await.unwrap();
     let agent = Arc::new(
         Agent::new(AgentConfig {
-            net: Some(client),
-            urls: vec![Url::parse_url("stun:8.8.4.4:443").unwrap()],
+            net: Some(client.clone()),
+            urls: vec![
+                Url::parse_url("stun:8.8.4.4:443").unwrap(),
+                Url::parse_url("stun:8.8.4.4:3479").unwrap(),
+            ],
+            grouped_physical_stun: true,
             ..Default::default()
         })
         .await
@@ -343,6 +348,8 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
         .add_to_as(&mut response, ATTR_OTHER_ADDRESS)
         .unwrap();
         primary.send_to(&response.raw, from).await.unwrap();
+        let (next, from) = read(&*ordinary).await;
+        ordinary.send_to(&success(next.transaction_id, baseline).raw, from).await.unwrap();
         let (change, from) = read(&*primary).await;
         assert_eq!(from, source);
         assert_eq!(change.get(ATTR_CHANGE_REQUEST).unwrap(), 2u32.to_be_bytes());
@@ -367,6 +374,9 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
             port_changed: 1,
             alternate_tested: 1,
             alternate_changed: 1,
+            // The first two live destinations agree, the third differs. Calling
+            // this socket stable would ignore the validated alternate.
+            ordered_profiles: [0, 0, 0, 1],
             ..Default::default()
         }
     );
@@ -378,6 +388,19 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
     assert_eq!(alternates.len(), 1);
     assert_eq!(alternates[0].addr(), source);
     assert!(alternates[0].get_conn().is_none());
+    let group = agent.grouped_public_candidates().await;
+    assert_eq!(group, vec![(cand.id(), match original {
+        SocketAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    }, 2)]);
+    let stable: SocketAddrV4 = "1.1.1.1:46500".parse().unwrap();
+    let stable_socket = installed_at(client.bind(SocketAddr::V4(stable)).await.unwrap(), SocketAddr::V4(stable));
+    agent.internal.add_candidate(&stable_socket).await.unwrap();
+    let group = agent.grouped_public_candidates().await;
+    assert_eq!(group.len(), 2);
+    assert_eq!(group[0].1, stable);
+    assert_eq!(group[1].0, cand.id());
+    assert_eq!(SocketAddr::V4(group[1].1), source);
     let trickled: Local = Arc::new(
         crate::candidate::candidate_base::unmarshal_candidate(&alternates[0].marshal()).unwrap(),
     );
@@ -403,7 +426,7 @@ async fn authenticated_socket_measurement_tests_change_port_and_caches_per_gener
     })
     .await
     .unwrap();
-    assert_eq!(agent.udp_socket_diagnostics().unwrap().candidate_readers, 1);
+    assert_eq!(agent.udp_socket_diagnostics().unwrap().candidate_readers, 2);
     agent.restart(String::new(), String::new()).await.unwrap();
     assert!(agent.udp_mapping_stats().is_none());
     assert!(agent.observed_udp_candidates().await.is_empty());
