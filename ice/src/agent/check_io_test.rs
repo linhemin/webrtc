@@ -221,6 +221,8 @@ async fn check_io_records_kernel_send_errors() -> Result<()> {
         .await;
     let stats = agent.get_candidate_pairs_stats().await;
     assert_eq!((stats[0].requests_sent, stats[0].responses_sent), (0, 0));
+    let udp = agent.udp_socket_diagnostics().unwrap();
+    assert_eq!((udp.response_writes, udp.response_write_errors), (0, 1));
     assert_eq!(
         (
             stats[0].request_send_failures,
@@ -287,7 +289,7 @@ async fn udp_socket_diagnostics_reads_before_decode_and_attributes_the_drop() ->
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let s = agent.udp_socket_diagnostics().unwrap();
-            if s.req_accepted == 2 {
+            if s.req_accepted == 2 && s.response_writes == 2 {
                 break s;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -303,6 +305,7 @@ async fn udp_socket_diagnostics_reads_before_decode_and_attributes_the_drop() ->
     assert_eq!(result.binding_request, 7);
     assert_eq!(result.req_role_conflict, 1);
     assert_eq!(result.req_username_missing, 1);
+    assert_eq!(result.response_write_errors, 0);
     assert_eq!(result.req_username_invalid, 1);
     assert_eq!(result.req_integrity_missing, 1);
     assert_eq!(result.req_integrity_invalid, 1);

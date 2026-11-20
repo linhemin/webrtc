@@ -758,6 +758,13 @@ impl AgentInternal {
         } else {
             let sent = self.send_stun(&out, local, remote).await;
             pair.check_io.lock().record_sent_response(sent);
+            self.socket_rx.direct(local, |stats| {
+                if sent {
+                    &stats.response_writes
+                } else {
+                    &stats.response_write_errors
+                }
+            });
         }
     }
 

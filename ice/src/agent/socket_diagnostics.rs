@@ -44,6 +44,7 @@ counters! {
     stun_decode_error, binding_request, binding_success, binding_error, binding_indication, other_stun,
     req_known_source, req_unlisted_source, req_role_conflict, req_username_missing, req_username_invalid,
     req_integrity_missing, req_integrity_invalid, req_candidate_failed, req_accepted,
+    response_writes, response_write_errors,
     resp_role_conflict, resp_integrity_missing, resp_integrity_invalid, resp_unknown_remote,
     resp_unknown_transaction, resp_wrong_endpoint, resp_no_pair, resp_accepted,
     gather_reads, gather_binding_requests, gather_matched_responses,
