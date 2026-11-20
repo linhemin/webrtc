@@ -82,6 +82,14 @@ impl RTCIceTransport {
         }
     }
 
+    /// Per-agent counters for UDP connectivity checks, including ingress before authentication.
+    /// None means there is no current agent or collection was not compiled for this target.
+    pub async fn udp_socket_diagnostics(
+        &self,
+    ) -> Option<ice::agent::socket_diagnostics::UdpSocketDiagnostics> {
+        self.gatherer.get_agent().await?.udp_socket_diagnostics()
+    }
+
     /// get_selected_candidate_pair returns the selected candidate pair on which packets are sent
     /// if there is no selected pair nil is returned
     pub async fn get_selected_candidate_pair(&self) -> Option<RTCIceCandidatePair> {

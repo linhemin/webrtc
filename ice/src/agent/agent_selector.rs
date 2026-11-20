@@ -325,6 +325,7 @@ impl ControllingSelector for AgentInternal {
             // Assert that NAT is not symmetric
             // https://tools.ietf.org/html/rfc8445#section-7.2.5.2.1
             if transaction_addr != remote_addr || pending_request.local_id != local.id() {
+                self.socket_rx.direct(local, |c| &c.resp_wrong_endpoint);
                 log::debug!("discard message: transaction source and destination does not match expected({}), actual({})", transaction_addr, remote);
                 return;
             }
@@ -337,6 +338,7 @@ impl ControllingSelector for AgentInternal {
             let selected_pair_is_none = self.agent_conn.get_selected_pair().is_none();
 
             if let Some(p) = self.find_pair(local, remote).await {
+                self.socket_rx.direct(local, |c| &c.resp_accepted);
                 p.check_rtt
                     .lock()
                     .record(pending_request.timestamp.elapsed());
@@ -356,9 +358,12 @@ impl ControllingSelector for AgentInternal {
                 }
             } else {
                 // This shouldn't happen
+                self.socket_rx.direct(local, |c| &c.resp_no_pair);
                 log::error!("Success response from invalid candidate pair");
             }
         } else {
+            self.socket_rx
+                .direct(local, |c| &c.resp_unknown_transaction);
             log::warn!(
                 "discard message from ({}), unknown TransactionID 0x{:?}",
                 remote,
@@ -379,6 +384,7 @@ impl ControllingSelector for AgentInternal {
             Some(pair) => pair,
             None => self.add_pair(local.clone(), remote.clone()).await,
         };
+        self.socket_rx.direct(local, |c| &c.req_accepted);
         pair.check_io.lock().requests_received += 1;
         self.send_binding_success(m, &pair).await;
         if pair_existed
@@ -453,6 +459,7 @@ impl ControlledSelector for AgentInternal {
             // Assert that NAT is not symmetric
             // https://tools.ietf.org/html/rfc8445#section-7.2.5.2.1
             if transaction_addr != remote_addr || pending_request.local_id != local.id() {
+                self.socket_rx.direct(local, |c| &c.resp_wrong_endpoint);
                 log::debug!("discard message: transaction source and destination does not match expected({}), actual({})", transaction_addr, remote);
                 return;
             }
@@ -464,6 +471,7 @@ impl ControlledSelector for AgentInternal {
             );
 
             if let Some(p) = self.find_pair(local, remote).await {
+                self.socket_rx.direct(local, |c| &c.resp_accepted);
                 p.check_rtt
                     .lock()
                     .record(pending_request.timestamp.elapsed());
@@ -478,9 +486,12 @@ impl ControlledSelector for AgentInternal {
                 }
             } else {
                 // This shouldn't happen
+                self.socket_rx.direct(local, |c| &c.resp_no_pair);
                 log::error!("Success response from invalid candidate pair");
             }
         } else {
+            self.socket_rx
+                .direct(local, |c| &c.resp_unknown_transaction);
             log::warn!(
                 "discard message from ({}), unknown TransactionID 0x{:?}",
                 remote,
@@ -500,6 +511,7 @@ impl ControlledSelector for AgentInternal {
         }
 
         if let Some(p) = self.find_pair(local, remote).await {
+            self.socket_rx.direct(local, |c| &c.req_accepted);
             p.check_io.lock().requests_received += 1;
             let use_candidate = m.contains(ATTR_USE_CANDIDATE);
             if use_candidate {
@@ -528,6 +540,8 @@ impl ControlledSelector for AgentInternal {
 
             self.send_binding_success(m, &p).await;
             self.ping_candidate(&p).await;
+        } else {
+            self.socket_rx.direct(local, |c| &c.req_candidate_failed);
         }
     }
 }

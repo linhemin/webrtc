@@ -17,6 +17,7 @@ use util::vnet::net::*;
 use util::Conn;
 
 use crate::agent::agent_config::{InterfaceFilterFn, IpFilterFn};
+use crate::agent::socket_diagnostics::SocketCounters;
 use crate::error::*;
 use crate::network_type::*;
 
@@ -70,8 +71,9 @@ pub(crate) async fn observed_mapping(
     conn: &Arc<dyn Conn + Send + Sync>,
     server_addr: SocketAddr,
     deadline: Duration,
+    socket_rx: &SocketCounters,
 ) -> Result<(XorMappedAddress, bool)> {
-    let (response, matched) = stun_exchange(conn, server_addr, deadline).await?;
+    let (response, matched) = stun_exchange(conn, server_addr, deadline, Some(socket_rx)).await?;
     let mut mapped = XorMappedAddress::default();
     mapped.get_from(&response)?;
     Ok((mapped, matched))
@@ -84,13 +86,14 @@ pub async fn stun_request(
     server_addr: SocketAddr,
     deadline: Duration,
 ) -> Result<Message> {
-    Ok(stun_exchange(conn, server_addr, deadline).await?.0)
+    Ok(stun_exchange(conn, server_addr, deadline, None).await?.0)
 }
 
 async fn stun_exchange(
     conn: &Arc<dyn Conn + Send + Sync>,
     server_addr: SocketAddr,
     deadline: Duration,
+    socket_rx: Option<&SocketCounters>,
 ) -> Result<(Message, bool)> {
     let mut request = Message::new();
     request.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
@@ -109,6 +112,9 @@ async fn stun_exchange(
         conn.recv_from(&mut bs).await?
     };
 
+    if let Some(rx) = socket_rx {
+        rx.gathering_read(&bs[..n]);
+    }
     let mut res = Message::new();
     res.raw = bs[..n].to_vec();
     res.decode()?;
@@ -116,6 +122,11 @@ async fn stun_exchange(
     let matched = source == server_addr
         && res.typ == BINDING_SUCCESS
         && res.transaction_id == request.transaction_id;
+    if matched {
+        if let Some(rx) = socket_rx {
+            rx.add(|c| &c.gather_matched_responses);
+        }
+    }
     Ok((res, matched))
 }
 

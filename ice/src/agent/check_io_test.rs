@@ -151,6 +151,14 @@ async fn check_io_counts_only_authenticated_requests_and_matched_socket_writes()
             ),
             (0, 0)
         );
+        let ingress = agent.udp_socket_diagnostics().unwrap();
+        assert_eq!(ingress.req_username_invalid, 1);
+        assert_eq!(ingress.req_integrity_invalid, 1);
+        assert_eq!(ingress.req_accepted, 1);
+        assert_eq!(ingress.resp_integrity_invalid, 1);
+        assert_eq!(ingress.resp_unknown_remote, 1);
+        assert_eq!(ingress.resp_unknown_transaction, 2);
+        assert_eq!(ingress.resp_accepted, 1);
         agent.close().await?;
     }
     Ok(())
@@ -220,5 +228,93 @@ async fn check_io_records_kernel_send_errors() -> Result<()> {
         ),
         (1, 1)
     );
+    agent.close().await
+}
+
+#[tokio::test]
+async fn udp_socket_diagnostics_reads_before_decode_and_attributes_the_drop() -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    let agent = Agent::new(AgentConfig {
+        is_controlling: true,
+        ..Default::default()
+    })
+    .await?;
+    let network = &agent.internal;
+    // Start the production recv_from loop without also starting a periodic ICE checklist.
+    network.started_ch_tx.lock().await.take();
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let local = socket.local_addr()?;
+    network.add_candidate(&host(local, Some(socket))?).await?;
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    let (username, password) = {
+        let creds = network.ufrag_pwd.lock().await;
+        (
+            format!("{}:{}", creds.local_ufrag, creds.remote_ufrag),
+            creds.local_pwd.clone(),
+        )
+    };
+    let mut bare = Message::new();
+    bare.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
+    let mut username_only = Message::new();
+    username_only.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username.clone())),
+    ])?;
+    let mut conflict = Message::new();
+    conflict.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(crate::control::AttrControlling(17)),
+    ])?;
+    let mut incomplete = bare.raw.clone();
+    incomplete[3] = 4; // Recognizable Binding request header with a missing attribute body.
+    let valid = incoming_check(&username, &password)?;
+    for bytes in [
+        b"data".to_vec(),
+        incomplete,
+        bare.raw,
+        username_only.raw,
+        incoming_check("wrong", &password)?.raw,
+        incoming_check(&username, "wrong")?.raw,
+        conflict.raw,
+        valid.raw.clone(),
+        valid.raw,
+    ] {
+        peer.send_to(&bytes, local).await?;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let s = agent.udp_socket_diagnostics().unwrap();
+            if s.req_accepted == 2 {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("peer's two valid packets must traverse the real socket");
+    assert_eq!(result.candidate_readers, 1);
+    assert_eq!(result.udp_reads, 9);
+    assert_eq!(result.binding_request_headers, 8);
+    assert_eq!(result.non_stun, 1);
+    assert_eq!(result.stun_decode_error, 1);
+    assert_eq!(result.binding_request, 7);
+    assert_eq!(result.req_role_conflict, 1);
+    assert_eq!(result.req_username_missing, 1);
+    assert_eq!(result.req_username_invalid, 1);
+    assert_eq!(result.req_integrity_missing, 1);
+    assert_eq!(result.req_integrity_invalid, 1);
+    assert_eq!(result.req_unlisted_source, 5);
+    assert_eq!(result.req_known_source, 1);
+    assert_eq!(result.gather_reads, 0);
+    // Another agent cannot observe the first agent's socket.
+    let independent = Agent::new(AgentConfig::default()).await?;
+    assert_eq!(
+        independent.udp_socket_diagnostics().unwrap(),
+        Default::default()
+    );
+    independent.close().await?;
     agent.close().await
 }

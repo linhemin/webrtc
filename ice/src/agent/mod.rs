@@ -17,6 +17,7 @@ pub(crate) mod agent_internal;
 pub mod agent_selector;
 pub mod agent_stats;
 pub mod agent_transport;
+pub mod socket_diagnostics;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -130,6 +131,11 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Snapshot of this agent's direct UDP receive loops, or None when not instrumented.
+    pub fn udp_socket_diagnostics(&self) -> Option<socket_diagnostics::UdpSocketDiagnostics> {
+        self.internal.socket_rx.snapshot()
+    }
+
     /// Creates a new Agent.
     pub async fn new(config: AgentConfig) -> Result<Self> {
         let mut mdns_name = config.multicast_dns_host_name.clone();

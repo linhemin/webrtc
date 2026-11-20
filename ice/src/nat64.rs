@@ -177,6 +177,8 @@ impl Discovery {
     }
 }
 
+use crate::agent::socket_diagnostics::{binding_request_header, SocketCounters};
+
 pub(crate) async fn candidate_socket(
     socket: &Socket,
     server: SocketAddr,
@@ -184,6 +186,7 @@ pub(crate) async fn candidate_socket(
     response_matches: bool,
     host: &str,
     discovery: &Discovery,
+    socket_rx: &SocketCounters,
 ) -> Result<Socket> {
     let (IpAddr::V6(server_ip), IpAddr::V4(public)) = (server.ip(), mapped.ip) else {
         return Ok(socket.clone());
@@ -206,11 +209,13 @@ pub(crate) async fn candidate_socket(
     }
     Ok(Arc::new(Translated {
         socket: socket.clone(),
+        socket_rx: socket_rx.clone(),
         prefix,
     }))
 }
 
 struct Translated {
+    socket_rx: SocketCounters,
     socket: Socket,
     prefix: Prefix,
 }
@@ -249,6 +254,10 @@ impl Conn for Translated {
             let (n, addr) = self.socket.recv_from(buf).await?;
             if let Some(peer) = self.source(addr) {
                 return Ok((n, peer));
+            }
+            self.socket_rx.add(|c| &c.nat64_source_drops);
+            if binding_request_header(&buf[..n]) {
+                self.socket_rx.add(|c| &c.nat64_binding_request_drops);
             }
         }
     }

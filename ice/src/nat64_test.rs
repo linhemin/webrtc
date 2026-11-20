@@ -157,9 +157,18 @@ async fn measured_socket_writes_translated_peer_and_restores_only_its_prefix() {
         ip: "203.0.113.1".parse().unwrap(),
         port: 44123,
     };
-    let socket = candidate_socket(&conn, server, &mapped, true, &stun.to_string(), &discovery)
-        .await
-        .unwrap();
+    let rx = SocketCounters::default();
+    let socket = candidate_socket(
+        &conn,
+        server,
+        &mapped,
+        true,
+        &stun.to_string(),
+        &discovery,
+        &rx,
+    )
+    .await
+    .unwrap();
     let peer: SocketAddr = "192.0.2.33:7331".parse().unwrap();
     let wire_peer: SocketAddr = "[2001:db8:122:344:c0:2:2100:0]:7331".parse().unwrap();
     socket.send_to(b"check", peer).await.unwrap();
@@ -175,7 +184,11 @@ async fn measured_socket_writes_translated_peer_and_restores_only_its_prefix() {
         "[2001:db8:999:344:c0:2:2100:0]:7331",
         "[2001:db8:122:344:c0:2:2100:1]:7331",
     ] {
-        back.send((b"foreign".to_vec(), impostor.parse().unwrap()))
+        let mut check = stun::message::Message::new();
+        check
+            .build(&[Box::new(stun::message::BINDING_REQUEST)])
+            .unwrap();
+        back.send((check.raw, impostor.parse().unwrap()))
             .await
             .unwrap();
     }
@@ -183,13 +196,28 @@ async fn measured_socket_writes_translated_peer_and_restores_only_its_prefix() {
     let mut buf = [0; 64];
     let (n, from) = socket.recv_from(&mut buf).await.unwrap();
     assert_eq!((from, &buf[..n]), (peer, &b"reply"[..]));
-    assert!(
-        candidate_socket(&conn, server, &mapped, false, &stun.to_string(), &discovery)
-            .await
-            .is_err()
+    let counts = rx.snapshot().unwrap();
+    assert_eq!(
+        (
+            counts.nat64_source_drops,
+            counts.nat64_binding_request_drops
+        ),
+        (3, 3)
     );
+    assert_eq!(counts.udp_reads, 0);
+    assert!(candidate_socket(
+        &conn,
+        server,
+        &mapped,
+        false,
+        &stun.to_string(),
+        &discovery,
+        &rx
+    )
+    .await
+    .is_err());
     assert!(
-        candidate_socket(&conn, server, &mapped, true, "192.0.2.99", &discovery)
+        candidate_socket(&conn, server, &mapped, true, "192.0.2.99", &discovery, &rx)
             .await
             .is_err()
     );
@@ -201,7 +229,8 @@ async fn measured_socket_writes_translated_peer_and_restores_only_its_prefix() {
         &mapped,
         true,
         &stun.to_string(),
-        &unavailable
+        &unavailable,
+        &rx
     )
     .await
     .is_err());
@@ -213,7 +242,8 @@ async fn measured_socket_writes_translated_peer_and_restores_only_its_prefix() {
         &mapped,
         true,
         &stun.to_string(),
-        &other_network
+        &other_network,
+        &rx
     )
     .await
     .is_err());
@@ -236,6 +266,7 @@ async fn native_sockets_are_unchanged_and_do_not_resolve_any_prefix() {
             false,
             "does-not-resolve.invalid",
             &discovery,
+            &SocketCounters::default(),
         )
         .await
         .unwrap();
@@ -283,12 +314,21 @@ async fn only_expected_stun_source_transaction_and_success_witness_the_mapping()
             };
             socket.send_to(&reply.raw, client).await.unwrap();
         };
+        let rx = SocketCounters::default();
         let (result, ()) = tokio::join!(
-            observed_mapping(&client, addr, Duration::from_secs(1)),
+            observed_mapping(&client, addr, Duration::from_secs(1), &rx),
             response
         );
         let (mapped, matched) = result.unwrap();
         assert_eq!(mapped.port, 34567);
         assert_eq!(matched, invalid.is_none());
+        let snap = rx.snapshot().unwrap();
+        assert_eq!(snap.gather_reads, 1);
+        assert_eq!(
+            snap.gather_binding_requests,
+            u64::from(invalid == Some("type"))
+        );
+        assert_eq!(snap.gather_matched_responses, u64::from(invalid.is_none()));
+        assert_eq!(snap.udp_reads, 0);
     }
 }

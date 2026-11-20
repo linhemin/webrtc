@@ -995,7 +995,12 @@ impl Agent {
         let built = async {
             let (mapped, matched) = before(
                 deadline,
-                observed_mapping(&conn, remote, STUN_GATHER_TIMEOUT),
+                observed_mapping(
+                    &conn,
+                    remote,
+                    STUN_GATHER_TIMEOUT,
+                    &params.agent_internal.socket_rx,
+                ),
             )
             .await?;
             let valid = matched
@@ -1017,6 +1022,7 @@ impl Agent {
                     matched,
                     _host,
                     &params.dns64,
+                    &params.agent_internal.socket_rx,
                 ),
             )
             .await?;

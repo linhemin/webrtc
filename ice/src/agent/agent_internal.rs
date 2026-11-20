@@ -21,6 +21,7 @@ pub(crate) struct UfragPwd {
 }
 
 pub struct AgentInternal {
+    pub(crate) socket_rx: super::socket_diagnostics::SocketCounters,
     // State owned by the taskLoop
     pub(crate) on_connected_tx: Mutex<Option<mpsc::Sender<()>>>,
     pub(crate) on_connected_rx: Mutex<Option<mpsc::Receiver<()>>>,
@@ -95,6 +96,7 @@ impl AgentInternal {
         let (started_ch_tx, _) = broadcast::channel(1);
 
         let ai = AgentInternal {
+            socket_rx: Default::default(),
             on_connected_tx: Mutex::new(Some(on_connected_tx)),
             on_connected_rx: Mutex::new(Some(on_connected_rx)),
 
@@ -813,6 +815,7 @@ impl AgentInternal {
         local: &Arc<dyn Candidate + Send + Sync>,
         remote: SocketAddr,
     ) {
+        self.socket_rx.decoded(local, m.typ);
         if m.typ.method != METHOD_BINDING
             || !(m.typ.class == CLASS_SUCCESS_RESPONSE
                 || m.typ.class == CLASS_REQUEST
@@ -831,12 +834,14 @@ impl AgentInternal {
 
         if self.is_controlling.load(Ordering::SeqCst) {
             if m.contains(ATTR_ICE_CONTROLLING) {
+                self.socket_rx.conflict(local, m.typ);
                 log::debug!(
                     "[{}]: inbound isControlling && a.isControlling == true",
                     self.get_name(),
                 );
                 return;
             } else if m.contains(ATTR_USE_CANDIDATE) {
+                self.socket_rx.conflict(local, m.typ);
                 log::debug!(
                     "[{}]: useCandidate && a.isControlling == true",
                     self.get_name(),
@@ -844,6 +849,7 @@ impl AgentInternal {
                 return;
             }
         } else if m.contains(ATTR_ICE_CONTROLLED) {
+            self.socket_rx.conflict(local, m.typ);
             log::debug!(
                 "[{}]: inbound isControlled && a.isControlling == false",
                 self.get_name(),
@@ -860,6 +866,7 @@ impl AgentInternal {
                 if let Err(err) =
                     assert_inbound_message_integrity(m, ufrag_pwd.remote_pwd.as_bytes())
                 {
+                    self.socket_rx.bad_integrity(local, m);
                     log::warn!(
                         "[{}]: discard message from ({}), {}",
                         self.get_name(),
@@ -873,6 +880,7 @@ impl AgentInternal {
             if let Some(rc) = &remote_candidate {
                 self.handle_success_response(m, local, rc, remote).await;
             } else {
+                self.socket_rx.direct(local, |c| &c.resp_unknown_remote);
                 log::warn!(
                     "[{}]: discard success message from ({}), no such remote",
                     self.get_name(),
@@ -881,11 +889,19 @@ impl AgentInternal {
                 return;
             }
         } else if m.typ.class == CLASS_REQUEST {
+            self.socket_rx.direct(local, |c| {
+                if remote_candidate.is_some() {
+                    &c.req_known_source
+                } else {
+                    &c.req_unlisted_source
+                }
+            });
             {
                 let ufrag_pwd = self.ufrag_pwd.lock().await;
                 let username =
                     ufrag_pwd.local_ufrag.clone() + ":" + ufrag_pwd.remote_ufrag.as_str();
                 if let Err(err) = assert_inbound_username(m, &username) {
+                    self.socket_rx.bad_username(local, m);
                     log::warn!(
                         "[{}]: discard message from ({}), {}",
                         self.get_name(),
@@ -896,6 +912,7 @@ impl AgentInternal {
                 } else if let Err(err) =
                     assert_inbound_message_integrity(m, ufrag_pwd.local_pwd.as_bytes())
                 {
+                    self.socket_rx.bad_integrity(local, m);
                     log::warn!(
                         "[{}]: discard message from ({}), {}",
                         self.get_name(),
@@ -924,6 +941,7 @@ impl AgentInternal {
                 match prflx_candidate_config.new_candidate_peer_reflexive() {
                     Ok(prflx_candidate) => remote_candidate = Some(Arc::new(prflx_candidate)),
                     Err(err) => {
+                        self.socket_rx.direct(local, |c| &c.req_candidate_failed);
                         log::error!(
                             "[{}]: Failed to create new remote prflx candidate ({})",
                             self.get_name(),
@@ -1117,6 +1135,7 @@ impl AgentInternal {
             }
         }
 
+        self.socket_rx.direct(&candidate, |c| &c.candidate_readers);
         let mut buffer = vec![0_u8; RECEIVE_MTU];
         let mut n;
         let mut src_addr;
@@ -1128,12 +1147,16 @@ impl AgentInternal {
                             n = num;
                             src_addr = src;
                        }
-                       Err(err) => return Err(Error::Other(err.to_string())),
+                       Err(err) => {
+                           self.socket_rx.direct(&candidate, |c| &c.udp_read_errors);
+                           return Err(Error::Other(err.to_string()));
+                       }
                    }
                },
                 _  = closed_ch_rx.recv() => return Err(Error::ErrClosed),
             }
 
+            self.socket_rx.read(&candidate, &buffer[..n]);
             self.handle_inbound_candidate_msg(&candidate, &buffer[..n], src_addr, addr)
                 .await;
         }
@@ -1155,6 +1178,7 @@ impl AgentInternal {
             m.raw.extend_from_slice(buf);
 
             if let Err(err) = m.decode() {
+                self.socket_rx.direct(c, |stats| &stats.stun_decode_error);
                 log::warn!(
                     "[{}]: Failed to handle decode ICE from {} to {}: {}",
                     self.get_name(),
@@ -1165,15 +1189,18 @@ impl AgentInternal {
             } else {
                 self.handle_inbound(&mut m, c, src_addr).await;
             }
-        } else if !self.validate_non_stun_traffic(c, src_addr).await {
-            log::warn!(
-                "[{}]: Discarded message, not a valid remote candidate",
-                self.get_name(),
-                //c.addr().await //from {}
-            );
-        } else if let Err(err) = self.agent_conn.buffer.write(buf).await {
-            // NOTE This will return packetio.ErrFull if the buffer ever manages to fill up.
-            log::warn!("[{}]: failed to write packet: {}", self.get_name(), err);
+        } else {
+            self.socket_rx.direct(c, |stats| &stats.non_stun);
+            if !self.validate_non_stun_traffic(c, src_addr).await {
+                log::warn!(
+                    "[{}]: Discarded message, not a valid remote candidate",
+                    self.get_name(),
+                    //c.addr().await //from {}
+                );
+            } else if let Err(err) = self.agent_conn.buffer.write(buf).await {
+                // NOTE This will return packetio.ErrFull if the buffer ever manages to fill up.
+                log::warn!("[{}]: failed to write packet: {}", self.get_name(), err);
+            }
         }
     }
 

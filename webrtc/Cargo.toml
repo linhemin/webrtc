@@ -66,6 +66,7 @@ tokio-test = "0.4"
 env_logger = "0.11.3"
 
 [features]
+ice-socket-diagnostics = ["ice/ice-socket-diagnostics"]
 pem = ["dep:pem", "dtls/pem"]
 openssl = ["srtp/openssl"]
 vendored-openssl = ["srtp/vendored-openssl"]
