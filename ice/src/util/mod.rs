@@ -108,6 +108,7 @@ async fn stun_exchange(
 ) -> Result<(Message, bool)> {
     let mut request = Message::new();
     request.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
+    request.add(stun::attributes::ATTR_SOFTWARE, b"RustDesk observation");
 
     conn.send_to(&request.raw, server_addr).await?;
     let mut bs = vec![0_u8; MAX_MESSAGE_SIZE];

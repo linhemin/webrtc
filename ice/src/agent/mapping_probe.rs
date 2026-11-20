@@ -46,6 +46,9 @@ pub struct MappingProbeStats {
     pub inconclusive: u32,
     pub alternate_tested: u32,
     pub alternate_changed: u32,
+    /// Stable, constant nonzero step, irregular, insufficient/address changed.
+    /// Only populated from sequential observations on a grouped retry.
+    pub ordered_profiles: [u32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +152,7 @@ impl Probes {
         request
             .build(&[Box::new(BINDING_REQUEST), Box::new(id)])
             .ok()?;
+        request.add(ATTR_SOFTWARE, b"RustDesk observation");
         if change_port {
             request.add(ATTR_CHANGE_REQUEST, &2u32.to_be_bytes());
         }
@@ -250,11 +254,13 @@ fn plain_address(m: &Message, kind: AttrType) -> Option<SocketAddr> {
 struct Sample {
     mappings: Vec<SocketAddrV4>,
     alternate_changed: Option<bool>,
+    ordered_profile: Option<usize>,
 }
 
 impl Sample {
     fn record(&self, stats: &mut MappingProbeStats) {
         stats.sockets += 1;
+        if let Some(kind) = self.ordered_profile { stats.ordered_profiles[kind] += 1; }
         match self.mappings.first() {
             Some(a) if self.mappings.len() >= 2 => {
                 if self.mappings.iter().any(|m| m.ip() != a.ip()) {
@@ -274,15 +280,36 @@ impl Sample {
     }
 }
 
-async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr]) -> Sample {
+// A constant step requires three equal changes at four distinct destinations
+// from the same socket. Mixed public addresses and short series are inconclusive.
+fn observed_profile(series: &[SocketAddrV4]) -> usize {
+    let Some(first) = series.first() else { return 3 };
+    if series.len() < 2 || series.iter().any(|ep| ep.ip() != first.ip()) { return 3; }
+    if series.iter().all(|ep| ep.port() == first.port()) { return 0; }
+    if series.len() < 4 { return 3; }
+    let mut steps = series.windows(2).map(|w| w[1].port().wrapping_sub(w[0].port()));
+    let step = steps.next().unwrap_or(0);
+    if step != 0 && steps.all(|d| d == step) { 1 } else { 2 }
+}
+
+async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], ordered: bool) -> Sample {
     let mut result = Sample::default();
     let gathered = probes.gathered.lock().get(&socket.id()).copied();
-    let replies = join_all(
-        endpoints
-            .iter()
-            .map(|&ep| probes.query(socket, ep, ep, false)),
-    )
-    .await;
+    let replies = if ordered {
+        let mut replies = Vec::with_capacity(endpoints.len());
+        for &ep in endpoints {
+            let reply = timeout(Duration::from_millis(450), probes.query(socket, ep, ep, false))
+                .await.ok().flatten();
+            replies.push(reply);
+        }
+        // Only live observations taken in send order count. A cached gather mapping
+        // can still be advertised but cannot establish the order of allocations.
+        let series = replies.iter().flatten().map(|r| r.mapped).collect::<Vec<_>>();
+        result.ordered_profile = Some(observed_profile(&series));
+        replies
+    } else {
+        join_all(endpoints.iter().map(|&ep| probes.query(socket, ep, ep, false))).await
+    };
     // Deduplicate by destination. A repeated request to one observer cannot establish stability.
     // The matched gather response is the observation that originated this published candidate.
     let mut observations: Vec<_> = endpoints
@@ -505,14 +532,15 @@ impl Agent {
             let agent = self.clone();
             work.spawn(async move {
                 let endpoints = agent.observers(&candidate).await;
-                let sample = sample(&agent.internal.mapping_probes, &candidate, &endpoints).await;
+                let sample = sample(&agent.internal.mapping_probes, &candidate, &endpoints, agent.grouped_physical_stun).await;
                 (candidate, sample)
             });
         }
         let total = work.len() as u32;
         let mut measurement = Measurement::default();
         // Dropping the JoinSet aborts stalled resolution/sends without retaining the sockets.
-        let _ = timeout(Duration::from_secs(3), async {
+        let limit = if self.grouped_physical_stun { Duration::from_secs(5) } else { Duration::from_secs(3) };
+        let _ = timeout(limit, async {
             while let Some(result) = work.join_next().await {
                 if let Ok((candidate, sample)) = result {
                     sample.record(&mut measurement.stats);
@@ -547,6 +575,9 @@ impl Agent {
             }
         })
         .await;
+        if self.grouped_physical_stun {
+            measurement.stats.ordered_profiles[3] += total - measurement.stats.sockets;
+        }
         measurement.stats.inconclusive += total - measurement.stats.sockets;
         measurement.stats.sockets = total;
         Ok(measurement)
@@ -658,3 +689,22 @@ impl Agent {
 #[cfg(test)]
 #[path = "mapping_probe_test.rs"]
 mod tests;
+
+#[cfg(test)]
+mod ordered_profile_tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_ordered_port_patterns_without_predicting_from_missing_samples() {
+        let make = |ports: &[u16]| ports.iter().map(|&p| SocketAddrV4::new(
+            "198.51.100.7".parse().unwrap(), p)).collect::<Vec<_>>();
+        assert_eq!(observed_profile(&make(&[4000,4000])),0);
+        assert_eq!(observed_profile(&make(&[100,103,106,109])),1);
+        assert_eq!(observed_profile(&make(&[115,110,105,100])),1);
+        assert_eq!(observed_profile(&make(&[100,113,104,101])),2);
+        assert_eq!(observed_profile(&make(&[100,101,102])),3);
+        let mut changed=make(&[101,101,101,101]);
+        changed[2].set_ip("198.51.100.8".parse().unwrap());
+        assert_eq!(observed_profile(&changed),3);
+    }
+}

@@ -152,7 +152,7 @@ async fn independent_observers_measure_same_live_socket_while_peer_ice_still_wor
             }
         };
         let (outcome, ()) = tokio::join!(
-            sample(&agent.internal.mapping_probes, &candidate, &observers),
+            sample(&agent.internal.mapping_probes, &candidate, &observers, false),
             reply
         );
         let mut stats = MappingProbeStats::default();
