@@ -109,12 +109,13 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
         false,
         tx.clone(),
     ));
-    for (enabled, corrupt, mode, relay_only, expect_calls) in [
-        (true, false, MulticastDnsMode::Disabled, false, 2),
-        (true, true, MulticastDnsMode::Disabled, false, 2),
-        (false, false, MulticastDnsMode::Disabled, false, 0),
-        (true, false, MulticastDnsMode::QueryAndGather, false, 0),
-        (true, false, MulticastDnsMode::Disabled, true, 0),
+    for (enabled, grouped, corrupt, mode, relay_only, expect_calls) in [
+        (true, false, false, MulticastDnsMode::Disabled, false, 2),
+        (true, true, false, MulticastDnsMode::Disabled, false, 4),
+        (true, false, true, MulticastDnsMode::Disabled, false, 2),
+        (false, true, false, MulticastDnsMode::Disabled, false, 0),
+        (true, true, false, MulticastDnsMode::QueryAndGather, false, 0),
+        (true, true, false, MulticastDnsMode::Disabled, true, 0),
     ] {
         let socket = server.bind(physical.into()).await?;
         let physical_stun = tokio::spawn(serve(socket.clone(), mapped, corrupt, tx.clone()));
@@ -133,6 +134,7 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
                 vec![CandidateType::Host, CandidateType::ServerReflexive]
             },
             gather_interface_srflx: enabled,
+            grouped_physical_stun: grouped,
             interface_stun_provider: Some(provider.clone()),
             ip_filter: Arc::new(Some(Box::new(
                 |ip| matches!(ip, IpAddr::V4(v4) if [20,21].contains(&v4.octets()[3])),

@@ -72,6 +72,7 @@ pub(crate) struct Probes {
 #[derive(Default)]
 struct Measurement {
     stats: MappingProbeStats,
+    ranks: HashMap<String, u8>,
     // Kept only in this ICE generation. The diagnostic payload contains counts only.
     alternates: Vec<(Weak<dyn Candidate + Send + Sync>, Vec<SocketAddrV4>)>,
 }
@@ -296,6 +297,7 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr]) -> Sa
         }
     }
     let mut alternate = None;
+    let observed_targets: HashSet<_> = observations.iter().map(|(ep, _)| *ep).collect();
     for (ep, obs) in observations {
         result.mappings.push(obs.mapped);
         if alternate.is_none() {
@@ -312,7 +314,9 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr]) -> Sa
         };
         if let Ok(Some(other)) = timeout(Duration::from_millis(1450), exchange).await {
             result.alternate_changed = Some(other.mapped != baseline);
-            result.mappings.push(other.mapped);
+            if !observed_targets.contains(&alt) {
+                result.mappings.push(other.mapped);
+            }
         }
     }
     result
@@ -430,6 +434,29 @@ impl Agent {
         locals
     }
 
+    pub async fn grouped_public_candidates(self: &Arc<Self>) -> Vec<(String, SocketAddrV4, u8)> {
+        self.measure_udp_mappings().await;
+        let epoch = self.internal.mapping_probes.epoch.lock().clone();
+        let sockets = self.public_udp_sockets().await;
+        let physical = self.internal.mapping_probes.physical.lock();
+        let mut ranked = Vec::new();
+        for socket in sockets {
+            if self.interface_stun_provider.is_some()
+                && !physical.iter().any(|p| p.ptr_eq(&Arc::downgrade(&socket))) {
+                continue;
+            }
+            let SocketAddr::V4(endpoint) = socket.addr() else { continue };
+            let id = socket.id();
+            let rank = epoch.get().and_then(|m| m.ranks.get(&id)).copied().unwrap_or(1);
+            ranked.push((id, endpoint, rank));
+        }
+        ranked.sort_by_key(|(_, _, rank)| *rank);
+        let mut seen = HashSet::new();
+        ranked.retain(|(_, endpoint, _)| seen.insert(*endpoint));
+        ranked.truncate(3);
+        ranked
+    }
+
     pub async fn timed_local_candidate(&self) -> Option<Local> {
         let sockets = self.public_udp_sockets().await;
         if self.interface_stun_provider.is_some() {
@@ -490,6 +517,14 @@ impl Agent {
                 if let Ok((candidate, sample)) = result {
                     sample.record(&mut measurement.stats);
                     let base = candidate.addr();
+                    let rank = if sample.mappings.len() < 2 {
+                        1 // insufficient observations
+                    } else if sample.mappings.iter().all(|m| SocketAddr::V4(*m) == base) {
+                        0 // multiple destinations saw the advertised endpoint
+                    } else {
+                        2 // at least one observation disagrees with the advertised endpoint
+                    };
+                    measurement.ranks.insert(candidate.id(), rank);
                     let mut alternates = Vec::new();
                     // The final observation, when present, is the alternate-port test.
                     for addr in sample.mappings.into_iter().rev() {

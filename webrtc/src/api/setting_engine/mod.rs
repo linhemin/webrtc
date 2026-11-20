@@ -48,6 +48,7 @@ pub struct Candidates {
     pub interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub ip_filter: Arc<Option<IpFilterFn>>,
     pub gather_interface_srflx: bool,
+    pub grouped_physical_stun: bool,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub nat_1to1_ips: Vec<String>,
     pub nat_1to1_ip_candidate_type: RTCIceCandidateType,
@@ -199,6 +200,10 @@ impl SettingEngine {
     /// the amount of information you wish to expose to the remote peer
     pub fn set_interface_filter(&mut self, filter: InterfaceFilterFn) {
         self.candidates.interface_filter = Arc::new(Some(filter));
+    }
+
+    pub fn set_grouped_physical_stun(&mut self, enabled: bool) {
+        self.candidates.grouped_physical_stun = enabled;
     }
 
     /// Also gather bounded, source-specific UDP STUN mappings using the host-candidate filters.

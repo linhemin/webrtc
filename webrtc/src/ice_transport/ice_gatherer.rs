@@ -129,6 +129,7 @@ impl RTCIceGatherer {
             interface_filter: self.setting_engine.candidates.interface_filter.clone(),
             ip_filter: self.setting_engine.candidates.ip_filter.clone(),
             gather_interface_srflx: self.setting_engine.candidates.gather_interface_srflx,
+            grouped_physical_stun: self.setting_engine.candidates.grouped_physical_stun,
             interface_stun_provider: self
                 .setting_engine
                 .candidates

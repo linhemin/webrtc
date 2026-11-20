@@ -121,6 +121,7 @@ async fn dual_stack_stun_keeps_native_aaaa_and_adds_verified_translated_a() -> R
                 params.clone(),
                 agent.interface_filter.clone(),
                 agent.ip_filter.clone(),
+                false,
                 false
             ),
             respond

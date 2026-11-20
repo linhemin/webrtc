@@ -39,6 +39,7 @@ pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) interface_filter: Arc<Option<InterfaceFilterFn>>,
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
+    pub(crate) grouped_physical_stun: bool,
     pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub(crate) ext_ip_mapper: Arc<Option<ExternalIpMapper>>,
     pub(crate) agent_internal: Arc<AgentInternal>,
@@ -208,6 +209,7 @@ impl Agent {
                         let interface_filter = Arc::clone(&params.interface_filter);
                         let ip_filter = Arc::clone(&params.ip_filter);
                         let include_loopback = params.include_loopback;
+                        let grouped = params.grouped_physical_stun;
                         let worker = wg.worker();
                         tokio::spawn(async move {
                             let _worker = worker;
@@ -216,6 +218,7 @@ impl Agent {
                                 interface_filter,
                                 ip_filter,
                                 include_loopback,
+                                grouped,
                             )
                             .await;
                         });
@@ -718,6 +721,7 @@ impl Agent {
         interface_filter: Arc<Option<InterfaceFilterFn>>,
         ip_filter: Arc<Option<IpFilterFn>>,
         include_loopback: bool,
+        grouped: bool,
     ) {
         const MAX_SOURCES_PER_FAMILY: usize = 4;
         const MAX_STUN_SERVERS: usize = 2;
@@ -788,6 +792,13 @@ impl Agent {
                     })
                     .take(MAX_SOURCES_PER_FAMILY),
             );
+        }
+        // One physical source can provide three independent mappings on group retries.
+        // Retain the per-interface filters and cap extra work across the whole agent.
+        if grouped {
+            if let Some(primary) = paths.iter().find(|(_, provider)| provider.is_some()).cloned() {
+                paths.extend([primary.clone(), primary]);
+            }
         }
         for (source, physical) in paths {
             let worker = wg.worker();

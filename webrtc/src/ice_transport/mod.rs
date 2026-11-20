@@ -121,6 +121,11 @@ impl RTCIceTransport {
             .collect()
     }
 
+    pub async fn grouped_public_candidates(&self) -> Vec<(String, std::net::SocketAddrV4, u8)> {
+        let Some(agent) = self.gatherer.get_agent().await else { return Vec::new() };
+        agent.grouped_public_candidates().await
+    }
+
     pub async fn timed_local_candidate(&self) -> Option<(String, std::net::SocketAddrV4)> {
         let c = self.gatherer.get_agent().await?.timed_local_candidate().await?;
         match c.addr() {

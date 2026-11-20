@@ -194,6 +194,8 @@ pub struct AgentConfig {
 
     /// Also obtain a bounded set of STUN mappings from eligible local host addresses.
     pub gather_interface_srflx: bool,
+    /// Gather up to three separate physical sockets for an agreed group check.
+    pub grouped_physical_stun: bool,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
 
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
