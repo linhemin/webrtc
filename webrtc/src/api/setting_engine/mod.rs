@@ -34,6 +34,7 @@ pub struct Timeout {
     /// without a response before marking it failed. `None` keeps the ICE
     /// crate's default (7, i.e. ~1.4s at the default 200ms check interval).
     pub ice_max_binding_requests: Option<u16>,
+    pub ice_pace_connectivity_checks: bool,
     /// How often the ICE agent runs a connectivity-check tick, sending one
     /// binding request on each pair still waiting for a response. `None`
     /// keeps the ICE crate's default (200ms).
@@ -136,6 +137,12 @@ impl SettingEngine {
     /// still connect once the path clears.
     pub fn set_ice_max_binding_requests(&mut self, n: Option<u16>) {
         self.timeout.ice_max_binding_requests = n;
+    }
+
+    /// Pace ordinary connectivity checks across pairs; received authenticated checks
+    /// can still trigger an immediate check to their actual source.
+    pub fn set_ice_pace_connectivity_checks(&mut self, enabled: bool) {
+        self.timeout.ice_pace_connectivity_checks = enabled;
     }
 
     /// set_ice_check_interval sets how often the ICE agent sends a binding

@@ -20,6 +20,7 @@ pub mod agent_transport;
 pub mod socket_diagnostics;
 pub mod mapping_probe;
 mod gateway_candidate;
+mod check_pacing;
 
 use std::collections::HashMap;
 use std::future::Future;

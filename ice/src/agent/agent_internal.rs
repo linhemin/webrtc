@@ -69,6 +69,7 @@ pub struct AgentInternal {
     // the following variables won't be changed after init_with_defaults()
     pub(crate) insecure_skip_verify: bool,
     pub(crate) max_binding_requests: u16,
+    check_pacing: Option<SyncMutex<super::check_pacing::CheckPacing>>,
     pub(crate) host_acceptance_min_wait: Duration,
     pub(crate) srflx_acceptance_min_wait: Duration,
     pub(crate) prflx_acceptance_min_wait: Duration,
@@ -133,6 +134,7 @@ impl AgentInternal {
 
             //won't change after init_with_defaults()
             max_binding_requests: 0,
+            check_pacing: config.pace_connectivity_checks.then(Default::default),
             host_acceptance_min_wait: Duration::from_secs(0),
             srflx_acceptance_min_wait: Duration::from_secs(0),
             prflx_acceptance_min_wait: Duration::from_secs(0),
@@ -381,10 +383,9 @@ impl AgentInternal {
             }
             for p in &mut *checklist {
                 let p_state = p.state.load(Ordering::SeqCst);
-                if p_state == CandidatePairState::Waiting as u8 {
-                    p.state
-                        .store(CandidatePairState::InProgress as u8, Ordering::SeqCst);
-                } else if p_state != CandidatePairState::InProgress as u8 {
+                if p_state != CandidatePairState::Waiting as u8
+                    && p_state != CandidatePairState::InProgress as u8
+                {
                     continue;
                 }
 
@@ -397,9 +398,20 @@ impl AgentInternal {
                     p.state
                         .store(CandidatePairState::Failed as u8, Ordering::SeqCst);
                 } else {
-                    p.binding_request_count.fetch_add(1, Ordering::SeqCst);
                     pairs.push(p.clone());
                 }
+            }
+            if let Some(pacer) = &self.check_pacing {
+                pacer.lock().choose(&mut pairs, Instant::now());
+            }
+            for pair in &pairs {
+                let _ = pair.state.compare_exchange(
+                    CandidatePairState::Waiting as u8,
+                    CandidatePairState::InProgress as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                pair.binding_request_count.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -502,6 +514,13 @@ impl AgentInternal {
                 self.ping_candidate(&pair).await;
             }
         }
+    }
+
+    pub(crate) fn wake_synchronized_check(&self) {
+        if let Some(pacer) = &self.check_pacing {
+            pacer.lock().ensure_one();
+        }
+        self.request_connectivity_check();
     }
 
     pub(crate) fn request_connectivity_check(&self) {

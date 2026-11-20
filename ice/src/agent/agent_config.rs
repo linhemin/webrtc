@@ -151,6 +151,8 @@ pub struct AgentConfig {
     /// or nomination, if after max_binding_requests the candidate is yet to answer a binding
     /// request or a nomination we set the pair as failed.
     pub max_binding_requests: Option<u16>,
+    /// Share a bounded ordinary-check budget across large trickled UDP checklists.
+    pub pace_connectivity_checks: bool,
 
     pub is_controlling: bool,
 
