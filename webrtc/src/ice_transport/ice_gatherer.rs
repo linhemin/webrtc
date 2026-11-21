@@ -130,6 +130,7 @@ impl RTCIceGatherer {
             ip_filter: self.setting_engine.candidates.ip_filter.clone(),
             gather_interface_srflx: self.setting_engine.candidates.gather_interface_srflx,
             grouped_physical_stun: self.setting_engine.candidates.grouped_physical_stun,
+            expanded_udp_observer: self.setting_engine.candidates.expanded_udp_observer,
             interface_stun_provider: self
                 .setting_engine
                 .candidates

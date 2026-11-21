@@ -121,6 +121,16 @@ impl RTCIceTransport {
             .collect()
     }
 
+    pub async fn expanded_udp_candidates(&self) -> Vec<(String, std::net::SocketAddrV4)> {
+        let Some(agent) = self.gatherer.get_agent().await else { return Vec::new() };
+        agent.expanded_udp_candidates().await
+    }
+
+    pub async fn expanded_udp_pool_complete(&self) -> bool {
+        let Some(agent) = self.gatherer.get_agent().await else { return false };
+        agent.expanded_udp_pool_complete()
+    }
+
     pub async fn grouped_public_candidates(&self) -> Vec<(String, std::net::SocketAddrV4, u8)> {
         let Some(agent) = self.gatherer.get_agent().await else { return Vec::new() };
         agent.grouped_public_candidates().await

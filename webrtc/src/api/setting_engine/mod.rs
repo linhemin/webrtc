@@ -49,6 +49,7 @@ pub struct Candidates {
     pub ip_filter: Arc<Option<IpFilterFn>>,
     pub gather_interface_srflx: bool,
     pub grouped_physical_stun: bool,
+    pub expanded_udp_observer: Option<std::net::SocketAddrV4>,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub nat_1to1_ips: Vec<String>,
     pub nat_1to1_ip_candidate_type: RTCIceCandidateType,
@@ -200,6 +201,11 @@ impl SettingEngine {
     /// the amount of information you wish to expose to the remote peer
     pub fn set_interface_filter(&mut self, filter: InterfaceFilterFn) {
         self.candidates.interface_filter = Arc::new(Some(filter));
+    }
+
+    /// Allocate fresh local ports for a negotiated full retry using this verified observer.
+    pub fn set_expanded_udp_pool(&mut self, signed_observer: std::net::SocketAddrV4) {
+        self.candidates.expanded_udp_observer = Some(signed_observer);
     }
 
     pub fn set_grouped_physical_stun(&mut self, enabled: bool) {

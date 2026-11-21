@@ -80,6 +80,7 @@ pub struct AgentInternal {
     // How long connectivity checks can fail before the ICE Agent
     // goes to failed
     pub(crate) failed_timeout: Duration,
+    pub(crate) checking_timeout: Duration,
     // How often should we send keepalive packets?
     // 0 means never
     pub(crate) keepalive_interval: Duration,
@@ -147,6 +148,7 @@ impl AgentInternal {
             // How long connectivity checks can fail before the ICE Agent
             // goes to failed
             failed_timeout: Duration::from_secs(0),
+            checking_timeout: Duration::ZERO,
 
             // How often should we send keepalive packets?
             // 0 means never
@@ -229,11 +231,11 @@ impl AgentInternal {
                 *checking_duration = Instant::now();
             }
 
-            // We have been in checking longer then Disconnect+Failed timeout, set the connection to Failed
+            // Initial full-tier gathering and checks may outlive the established-path failure timer.
             if Instant::now()
                 .checked_duration_since(*checking_duration)
                 .unwrap_or_else(|| Duration::from_secs(0))
-                > self.disconnected_timeout + self.failed_timeout
+                > self.checking_timeout
             {
                 self.update_connection_state(ConnectionState::Failed).await;
                 *last_connection_state = self.connection_state.load(Ordering::SeqCst).into();

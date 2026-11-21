@@ -69,6 +69,7 @@ struct Pending {
 pub(crate) struct Probes {
     gathered: Mutex<HashMap<String, (SocketAddr, Observation)>>,
     physical: Mutex<Vec<Weak<dyn Candidate + Send + Sync>>>,
+    expanded: Mutex<Vec<Weak<dyn Candidate + Send + Sync>>>,
     active: AtomicBool,
     pending: Mutex<HashMap<TransactionId, Pending>>,
     epoch: Mutex<Arc<OnceCell<Measurement>>>,
@@ -84,6 +85,10 @@ struct Measurement {
 }
 
 impl Probes {
+    pub(super) fn mark_expanded(&self, c: &Local) {
+        self.expanded.lock().push(Arc::downgrade(c));
+    }
+
     pub(super) fn mark_physical(&self, c: &Local) {
         self.physical.lock().push(Arc::downgrade(c));
     }
@@ -115,6 +120,7 @@ impl Probes {
     pub(crate) fn reset(&self) {
         *self.epoch.lock() = Default::default();
         self.physical.lock().clear();
+        self.expanded.lock().clear();
         self.gathered.lock().clear();
         let mut pending = self.pending.lock();
         pending.clear();
@@ -485,6 +491,21 @@ impl Agent {
             });
         }
         locals
+    }
+
+    pub fn expanded_udp_pool_complete(&self) -> bool {
+        super::GatheringState::from(self.gathering_state.load(Ordering::SeqCst)) == super::GatheringState::Complete
+    }
+
+    pub async fn expanded_udp_candidates(&self) -> Vec<(String, SocketAddrV4)> {
+        let locals = self.internal.local_candidates.lock().await;
+        let pool = self.internal.mapping_probes.expanded.lock();
+        let mut seen = HashSet::new();
+        locals.get(&NetworkType::Udp4).into_iter().flatten().filter_map(|c| {
+            let SocketAddr::V4(addr) = c.addr() else { return None };
+            (pool.iter().any(|registered| registered.ptr_eq(&Arc::downgrade(c))) && seen.insert(addr))
+                .then(|| (c.id(), addr))
+        }).collect()
     }
 
     pub async fn grouped_public_candidates(self: &Arc<Self>) -> Vec<(String, SocketAddrV4, u8)> {

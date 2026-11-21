@@ -122,7 +122,8 @@ async fn dual_stack_stun_keeps_native_aaaa_and_adds_verified_translated_a() -> R
                 agent.interface_filter.clone(),
                 agent.ip_filter.clone(),
                 false,
-                false
+                false,
+                None
             ),
             respond
         )
@@ -159,6 +160,56 @@ async fn dual_stack_stun_keeps_native_aaaa_and_adds_verified_translated_a() -> R
     .await
     .expect("data reached the v6 wire")?;
     assert_eq!(&buffer[..n], b"session data");
+
+    let signed_v4 = "1.1.1.1:3478".parse()?;
+    let serve_pool = async {
+        for _ in 0..32 {
+            let source = answer(&translated_stun, v4_map).await?;
+            assert_eq!(source.ip(), mobile);
+        }
+        Result::<()>::Ok(())
+    };
+    let ((), served) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            expanded_udp_pool::gather(&params, vec![mobile], signed_v4),
+            serve_pool
+        )
+    })
+    .await
+    .expect("the signed IPv4 observer answers via the discovered NAT64 prefix");
+    served?;
+    let pool = agent.expanded_udp_candidates().await;
+    assert_eq!(pool.len(), 32);
+    let (id, mapping) = &pool[31];
+    let chosen = agent
+        .get_local_candidates()
+        .await?
+        .into_iter()
+        .find(|c| &c.id() == id)
+        .unwrap();
+    let remote = CandidateServerReflexiveConfig {
+        base_config: CandidateBaseConfig {
+            network: "udp4".into(),
+            address: signed_v4.ip().to_string(),
+            port: signed_v4.port(),
+            component: COMPONENT_RTP,
+            ..Default::default()
+        },
+        rel_addr: signed_v4.ip().to_string(),
+        rel_port: signed_v4.port(),
+    }
+    .new_candidate_server_reflexive()?;
+    CandidatePair::new(chosen, Arc::new(remote), true)
+        .write(b"expanded NAT64")
+        .await?;
+    let (n, from) = tokio::time::timeout(
+        Duration::from_secs(1),
+        translated_stun.recv_from(&mut buffer),
+    )
+    .await
+    .unwrap()?;
+    assert_eq!(from.port(), mapping.port());
+    assert_eq!(&buffer[..n], b"expanded NAT64");
     agent.close().await?;
     router.lock().await.stop().await?;
     Ok(())

@@ -20,6 +20,9 @@ use crate::util::*;
 
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[path = "expanded_udp_pool.rs"]
+mod expanded_udp_pool;
+
 #[cfg(test)]
 #[path = "nat64_gather_test.rs"]
 mod nat64_gather_test;
@@ -40,6 +43,7 @@ pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
     pub(crate) grouped_physical_stun: bool,
+    pub(crate) expanded_udp_observer: Option<std::net::SocketAddrV4>,
     pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub(crate) ext_ip_mapper: Arc<Option<ExternalIpMapper>>,
     pub(crate) agent_internal: Arc<AgentInternal>,
@@ -210,6 +214,7 @@ impl Agent {
                         let ip_filter = Arc::clone(&params.ip_filter);
                         let include_loopback = params.include_loopback;
                         let grouped = params.grouped_physical_stun;
+                        let observer = params.expanded_udp_observer;
                         let worker = wg.worker();
                         tokio::spawn(async move {
                             let _worker = worker;
@@ -219,6 +224,7 @@ impl Agent {
                                 ip_filter,
                                 include_loopback,
                                 grouped,
+                                observer,
                             )
                             .await;
                         });
@@ -722,6 +728,7 @@ impl Agent {
         ip_filter: Arc<Option<IpFilterFn>>,
         include_loopback: bool,
         grouped: bool,
+        observer: Option<std::net::SocketAddrV4>,
     ) {
         const MAX_SOURCES_PER_FAMILY: usize = 4;
         const MAX_STUN_SERVERS: usize = 2;
@@ -744,7 +751,7 @@ impl Agent {
                 }
             }
         }
-        if urls.is_empty() {
+        if urls.is_empty() && observer.is_none() {
             return;
         }
         let udp_types: Vec<_> = params
@@ -799,6 +806,15 @@ impl Agent {
             if let Some(primary) = paths.iter().find(|(_, provider)| provider.is_some()).cloned() {
                 paths.extend([primary.clone(), primary]);
             }
+        }
+        if let Some(observer) = observer {
+            let worker = wg.worker();
+            let params = params.clone();
+            let sources = sources.into_iter().collect();
+            tokio::spawn(async move {
+                let _worker = worker;
+                expanded_udp_pool::gather(&params, sources, observer).await;
+            });
         }
         for (source, physical) in paths {
             let worker = wg.worker();
@@ -1007,6 +1023,18 @@ impl Agent {
         deadline: Option<Instant>,
         require_mapped_v4: bool,
     ) -> Result<Option<IpAddr>> {
+        Self::install_observed_socket(params, conn, remote, _host, deadline, require_mapped_v4, false).await
+    }
+
+    async fn install_observed_socket(
+        params: &GatherCandidatesSrflxParams,
+        conn: Arc<dyn Conn + Send + Sync>,
+        remote: SocketAddr,
+        _host: &str,
+        deadline: Option<Instant>,
+        require_mapped_v4: bool,
+        expanded: bool,
+    ) -> Result<Option<IpAddr>> {
         let built = async {
             let (mapped, matched, response) = before(
                 deadline,
@@ -1022,6 +1050,9 @@ impl Agent {
                 && mapped.port > 0
                 && !mapped.ip.is_unspecified()
                 && !mapped.ip.is_multicast();
+            if expanded && !matches!(mapped.ip, IpAddr::V4(ip) if globally_reachable_ipv4(ip)) {
+                return Err(Error::ErrGetXorMappedAddrResponse);
+            }
             if require_mapped_v4
                 && (!valid || !matches!(mapped.ip, IpAddr::V4(ip) if !ip.is_broadcast()))
             {
@@ -1081,22 +1112,38 @@ impl Agent {
                 return Err(err);
             }
         };
-        if let Err(err) = params.agent_internal.add_candidate(&candidate).await {
-            let _ = candidate.close().await;
+        // Closing the agent takes done_tx before removing candidates. A late STUN
+        // reply must never leave a newly installed pool socket behind after close.
+        let open = if expanded {
+            Some(params.agent_internal.done_tx.lock().await)
+        } else {
+            None
+        };
+        if open.as_ref().is_some_and(|guard| guard.is_none()
+            || params.agent_internal.agent_conn.get_selected_pair().is_some()) {
+            let _ = conn.close().await;
+            return Err(Error::ErrClosed);
+        }
+        if let Err(err) = params.agent_internal.install_candidate(&candidate, !expanded).await {
+            let _ = conn.close().await;
             return Err(err);
         }
+        drop(open);
         if let Some(response) = response {
-            let locals = params.agent_internal.local_candidates.lock().await;
-            if locals
-                .get(&NetworkType::Udp4)
-                .into_iter()
-                .flatten()
-                .any(|c| Arc::ptr_eq(c, &candidate))
-            {
-                params
-                    .agent_internal
-                    .mapping_probes
-                    .remember(&candidate, remote, &response);
+            let installed = {
+                let locals = params.agent_internal.local_candidates.lock().await;
+                locals.get(&NetworkType::Udp4).into_iter().flatten().any(|c| Arc::ptr_eq(c, &candidate))
+            };
+            if installed {
+                params.agent_internal.mapping_probes.remember(&candidate, remote, &response);
+                if expanded {
+                    params.agent_internal.mapping_probes.mark_expanded(&candidate);
+                    // Never hold the agent's close gate while waiting for the trickle consumer.
+                    let tx = params.agent_internal.chan_candidate_tx.lock().await.clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.send(Some(candidate)).await;
+                    }
+                }
             }
         }
         Ok(observed)

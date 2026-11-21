@@ -196,6 +196,8 @@ pub struct AgentConfig {
     pub gather_interface_srflx: bool,
     /// Gather up to three separate physical sockets for an agreed group check.
     pub grouped_physical_stun: bool,
+    /// Application-authenticated first-party observer used only for negotiated full-tier gathering.
+    pub expanded_udp_observer: Option<std::net::SocketAddrV4>,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
 
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
@@ -249,6 +251,11 @@ impl AgentConfig {
             a.failed_timeout = failed_timeout;
         } else {
             a.failed_timeout = DEFAULT_FAILED_TIMEOUT;
+        }
+
+        a.checking_timeout = a.disconnected_timeout.saturating_add(a.failed_timeout);
+        if self.expanded_udp_observer.is_some() {
+            a.checking_timeout = a.checking_timeout.max(Duration::from_secs(60));
         }
 
         if let Some(keepalive_interval) = self.keepalive_interval {
