@@ -59,13 +59,14 @@ use crate::udp_mux::UDPMux;
 use crate::udp_network::UDPNetwork;
 use crate::url::*;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct BindingRequest {
     pub(crate) timestamp: Instant,
     pub(crate) transaction_id: TransactionId,
     pub(crate) local_id: String,
     pub(crate) destination: SocketAddr,
     pub(crate) is_use_candidate: bool,
+    pub(crate) expanded_target: Option<Arc<dyn Candidate + Send + Sync>>,
 }
 
 impl Default for BindingRequest {
@@ -76,6 +77,7 @@ impl Default for BindingRequest {
             local_id: String::new(),
             destination: SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 0),
             is_use_candidate: false,
+            expanded_target: None,
         }
     }
 }
@@ -118,7 +120,7 @@ pub struct Agent {
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
     pub(crate) grouped_physical_stun: bool,
-    pub(crate) expanded_udp_observer: Option<std::net::SocketAddrV4>,
+    pub(crate) expanded_udp_pool: Option<agent_config::ExpandedUdpPool>,
     pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     gateway_attempt: Mutex<Option<(String, String)>>,
     pub(crate) mdns_mode: MulticastDnsMode,
@@ -225,7 +227,7 @@ impl Agent {
             ip_filter: Arc::clone(&config.ip_filter),
             gather_interface_srflx: config.gather_interface_srflx,
             grouped_physical_stun: config.grouped_physical_stun,
-            expanded_udp_observer: config.expanded_udp_observer,
+            expanded_udp_pool: config.expanded_udp_pool.clone(),
             interface_stun_provider: config.interface_stun_provider.clone(),
             gateway_attempt: Mutex::new(None),
             mdns_mode,
@@ -494,7 +496,7 @@ impl Agent {
             ip_filter: self.ip_filter.clone(),
             gather_interface_srflx: self.gather_interface_srflx,
             grouped_physical_stun: self.grouped_physical_stun,
-            expanded_udp_observer: self.expanded_udp_observer,
+            expanded_udp_pool: self.expanded_udp_pool.clone(),
             interface_stun_provider: self.interface_stun_provider.clone(),
             ext_ip_mapper: Arc::clone(&self.ext_ip_mapper),
             agent_internal: Arc::clone(&self.internal),

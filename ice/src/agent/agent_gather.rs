@@ -43,7 +43,7 @@ pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) ip_filter: Arc<Option<IpFilterFn>>,
     pub(crate) gather_interface_srflx: bool,
     pub(crate) grouped_physical_stun: bool,
-    pub(crate) expanded_udp_observer: Option<std::net::SocketAddrV4>,
+    pub(crate) expanded_udp_pool: Option<super::agent_config::ExpandedUdpPool>,
     pub(crate) interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub(crate) ext_ip_mapper: Arc<Option<ExternalIpMapper>>,
     pub(crate) agent_internal: Arc<AgentInternal>,
@@ -214,7 +214,7 @@ impl Agent {
                         let ip_filter = Arc::clone(&params.ip_filter);
                         let include_loopback = params.include_loopback;
                         let grouped = params.grouped_physical_stun;
-                        let observer = params.expanded_udp_observer;
+                        let pool = params.expanded_udp_pool.clone();
                         let worker = wg.worker();
                         tokio::spawn(async move {
                             let _worker = worker;
@@ -224,7 +224,7 @@ impl Agent {
                                 ip_filter,
                                 include_loopback,
                                 grouped,
-                                observer,
+                                pool,
                             )
                             .await;
                         });
@@ -728,7 +728,7 @@ impl Agent {
         ip_filter: Arc<Option<IpFilterFn>>,
         include_loopback: bool,
         grouped: bool,
-        observer: Option<std::net::SocketAddrV4>,
+        pool: Option<super::agent_config::ExpandedUdpPool>,
     ) {
         const MAX_SOURCES_PER_FAMILY: usize = 4;
         const MAX_STUN_SERVERS: usize = 2;
@@ -751,7 +751,7 @@ impl Agent {
                 }
             }
         }
-        if urls.is_empty() && observer.is_none() {
+        if urls.is_empty() && pool.is_none() {
             return;
         }
         let udp_types: Vec<_> = params
@@ -807,13 +807,13 @@ impl Agent {
                 paths.extend([primary.clone(), primary]);
             }
         }
-        if let Some(observer) = observer {
+        if let Some(pool) = pool {
             let worker = wg.worker();
             let params = params.clone();
             let sources = sources.into_iter().collect();
             tokio::spawn(async move {
                 let _worker = worker;
-                expanded_udp_pool::gather(&params, sources, observer).await;
+                expanded_udp_pool::gather(&params, sources, pool).await;
             });
         }
         for (source, physical) in paths {
@@ -1124,6 +1124,9 @@ impl Agent {
             let _ = conn.close().await;
             return Err(Error::ErrClosed);
         }
+        if expanded {
+            params.agent_internal.mapping_probes.mark_expanded(&candidate);
+        }
         if let Err(err) = params.agent_internal.install_candidate(&candidate, !expanded).await {
             let _ = conn.close().await;
             return Err(err);
@@ -1136,14 +1139,6 @@ impl Agent {
             };
             if installed {
                 params.agent_internal.mapping_probes.remember(&candidate, remote, &response);
-                if expanded {
-                    params.agent_internal.mapping_probes.mark_expanded(&candidate);
-                    // Never hold the agent's close gate while waiting for the trickle consumer.
-                    let tx = params.agent_internal.chan_candidate_tx.lock().await.clone();
-                    if let Some(tx) = tx {
-                        let _ = tx.send(Some(candidate)).await;
-                    }
-                }
             }
         }
         Ok(observed)

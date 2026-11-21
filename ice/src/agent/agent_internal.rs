@@ -554,7 +554,9 @@ impl AgentInternal {
         }
 
         for cand in local_cands {
-            self.add_pair(cand, c.clone()).await;
+            if !self.mapping_probes.is_expanded(&cand) {
+                self.add_pair(cand, c.clone()).await;
+            }
         }
 
         self.request_connectivity_check();
@@ -616,7 +618,7 @@ impl AgentInternal {
         for cand in remote_cands {
             // A peer-reflexive address was learned on a specific receiving socket.
             // Other sockets only pair with it if they, too, receive an authenticated check.
-            if cand.candidate_type() != CandidateType::PeerReflexive {
+            if !self.mapping_probes.is_expanded(c) && cand.candidate_type() != CandidateType::PeerReflexive {
                 self.add_pair(c.clone(), cand).await;
             }
         }
@@ -746,6 +748,7 @@ impl AgentInternal {
                 local_id: local.id(),
                 destination: remote.addr(),
                 is_use_candidate: m.contains(ATTR_USE_CANDIDATE),
+                expanded_target: self.mapping_probes.is_expanded(local).then(|| remote.clone()),
             });
         }
 
@@ -914,6 +917,29 @@ impl AgentInternal {
                 }
             }
 
+            if self.mapping_probes.is_expanded(local) {
+                self.invalidate_pending_binding_requests(Instant::now()).await;
+                let target = self.pending_binding_requests.lock().await.iter().find(|request| {
+                    request.transaction_id == m.transaction_id
+                        && request.destination == remote
+                        && request.local_id == local.id()
+                }).and_then(|request| request.expanded_target.clone());
+                if let Some(target) = target {
+                    let candidate = match remote_candidate {
+                        Some(candidate) => candidate,
+                        None => {
+                            self.remember_remote_candidate(&target).await;
+                            self.find_remote_candidate(local.network_type(), remote)
+                                .await
+                                .unwrap_or(target)
+                        }
+                    };
+                    if self.find_pair(local, &candidate).await.is_none() {
+                        self.add_pair(local.clone(), candidate.clone()).await;
+                    }
+                    remote_candidate = Some(candidate);
+                }
+            }
             if let Some(rc) = &remote_candidate {
                 self.handle_success_response(m, local, rc, remote).await;
             } else {

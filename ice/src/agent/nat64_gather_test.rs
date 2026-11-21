@@ -171,7 +171,7 @@ async fn dual_stack_stun_keeps_native_aaaa_and_adds_verified_translated_a() -> R
     };
     let ((), served) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            expanded_udp_pool::gather(&params, vec![mobile], signed_v4),
+            expanded_udp_pool::gather(&params, vec![mobile], super::super::agent_config::ExpandedUdpPool { observers: vec![signed_v4], capacity: 32 }),
             serve_pool
         )
     })

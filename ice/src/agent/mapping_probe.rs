@@ -69,7 +69,7 @@ struct Pending {
 pub(crate) struct Probes {
     gathered: Mutex<HashMap<String, (SocketAddr, Observation)>>,
     physical: Mutex<Vec<Weak<dyn Candidate + Send + Sync>>>,
-    expanded: Mutex<Vec<Weak<dyn Candidate + Send + Sync>>>,
+    expanded: Mutex<HashSet<String>>,
     active: AtomicBool,
     pending: Mutex<HashMap<TransactionId, Pending>>,
     epoch: Mutex<Arc<OnceCell<Measurement>>>,
@@ -79,6 +79,7 @@ pub(crate) struct Probes {
 struct Measurement {
     stats: MappingProbeStats,
     ranks: HashMap<String, u8>,
+    ordered_profiles: HashMap<String, (u8, Option<u16>)>,
     corroborated_bases: HashSet<String>,
     // Kept only in this ICE generation. The diagnostic payload contains counts only.
     alternates: Vec<(Weak<dyn Candidate + Send + Sync>, Vec<SocketAddrV4>)>,
@@ -86,7 +87,12 @@ struct Measurement {
 
 impl Probes {
     pub(super) fn mark_expanded(&self, c: &Local) {
-        self.expanded.lock().push(Arc::downgrade(c));
+        self.expanded.lock().insert(c.id());
+    }
+
+    pub(super) fn is_expanded(&self, candidate: &Local) -> bool {
+        let pool = self.expanded.lock();
+        !pool.is_empty() && pool.contains(&candidate.id())
     }
 
     pub(super) fn mark_physical(&self, c: &Local) {
@@ -264,6 +270,7 @@ struct Sample {
     mappings: Vec<SocketAddrV4>,
     alternate_changed: Option<bool>,
     ordered_profile: Option<usize>,
+    linear_step: Option<u16>,
     base_corroborated: bool,
 }
 
@@ -372,7 +379,11 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
             .collect::<HashSet<_>>()
             .len() >= 2;
         let series: Vec<_> = live.into_iter().map(|(_, mapped)| mapped).collect();
-        result.ordered_profile = Some(observed_profile(&series));
+        let profile = observed_profile(&series);
+        result.ordered_profile = Some(profile);
+        if profile == 1 {
+            result.linear_step = Some(series[1].port().wrapping_sub(series[0].port()));
+        }
     }
     result
 }
@@ -503,9 +514,42 @@ impl Agent {
         let mut seen = HashSet::new();
         locals.get(&NetworkType::Udp4).into_iter().flatten().filter_map(|c| {
             let SocketAddr::V4(addr) = c.addr() else { return None };
-            (pool.iter().any(|registered| registered.ptr_eq(&Arc::downgrade(c))) && seen.insert(addr))
+            (pool.contains(&c.id()) && seen.insert(addr))
                 .then(|| (c.id(), addr))
         }).collect()
+    }
+
+    pub fn selected_mapping_profile(&self, selected_id: &str) -> Option<(u8, Option<u16>)> {
+        self.internal.mapping_probes.epoch.lock().get()?.ordered_profiles.get(selected_id).copied()
+    }
+
+    pub async fn release_unused_expanded_ports(&self) {
+        let Some(pair) = self.get_selected_candidate_pair() else { return };
+        let selected = pair.local.id();
+        // Wait for any install already under way. Later installs see the selected pair.
+        drop(self.internal.done_tx.lock().await);
+        let mut closing = Vec::new();
+        if let Some(sockets) = self.internal.local_candidates.lock().await.get_mut(&NetworkType::Udp4) {
+            sockets.retain(|socket| {
+                if self.internal.mapping_probes.is_expanded(socket) && socket.id() != selected {
+                    closing.push(socket.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if closing.is_empty() {
+            return;
+        }
+        let removed: HashSet<_> = closing.iter().map(|socket| socket.id()).collect();
+        self.internal.agent_conn.checklist.lock().await.retain(|p| !removed.contains(&p.local.id()));
+        self.internal.pending_binding_requests.lock().await.retain(|r| !removed.contains(&r.local_id));
+        for socket in closing {
+            if let Err(err) = socket.close().await {
+                log::trace!("Expanded ICE socket closed concurrently: {err}");
+            }
+        }
     }
 
     pub async fn grouped_public_candidates(self: &Arc<Self>) -> Vec<(String, SocketAddrV4, u8)> {
@@ -620,7 +664,11 @@ impl Agent {
                     } else {
                         2 // at least one observation disagrees with the advertised endpoint
                     };
-                    measurement.ranks.insert(candidate.id(), rank);
+                    let id = candidate.id();
+                    if let Some(profile) = sample.ordered_profile {
+                        measurement.ordered_profiles.insert(id.clone(), (profile as u8, sample.linear_step));
+                    }
+                    measurement.ranks.insert(id, rank);
                     if sample.base_corroborated {
                         measurement.corroborated_bases.insert(candidate.id());
                     }

@@ -131,6 +131,16 @@ impl RTCIceTransport {
         agent.expanded_udp_pool_complete()
     }
 
+    pub async fn selected_mapping_profile(&self, candidate_id: &str) -> Option<(u8, Option<u16>)> {
+        self.gatherer.get_agent().await?.selected_mapping_profile(candidate_id)
+    }
+
+    pub async fn release_unused_expanded_ports(&self) {
+        if let Some(agent) = self.gatherer.get_agent().await {
+            agent.release_unused_expanded_ports().await;
+        }
+    }
+
     pub async fn grouped_public_candidates(&self) -> Vec<(String, std::net::SocketAddrV4, u8)> {
         let Some(agent) = self.gatherer.get_agent().await else { return Vec::new() };
         agent.grouped_public_candidates().await

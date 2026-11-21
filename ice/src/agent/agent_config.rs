@@ -196,8 +196,8 @@ pub struct AgentConfig {
     pub gather_interface_srflx: bool,
     /// Gather up to three separate physical sockets for an agreed group check.
     pub grouped_physical_stun: bool,
-    /// Application-authenticated first-party observer used only for negotiated full-tier gathering.
-    pub expanded_udp_observer: Option<std::net::SocketAddrV4>,
+    /// First-party observers and local port budget for a negotiated full attempt.
+    pub expanded_udp_pool: Option<ExpandedUdpPool>,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
 
     /// Controls if self-signed certificates are accepted when connecting to TURN servers via TLS or
@@ -206,6 +206,12 @@ pub struct AgentConfig {
 
     /// Include loopback addresses in the candidate list.
     pub include_loopback: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExpandedUdpPool {
+    pub observers: Vec<std::net::SocketAddrV4>,
+    pub capacity: u16,
 }
 
 impl AgentConfig {
@@ -254,7 +260,7 @@ impl AgentConfig {
         }
 
         a.checking_timeout = a.disconnected_timeout.saturating_add(a.failed_timeout);
-        if self.expanded_udp_observer.is_some() {
+        if self.expanded_udp_pool.is_some() {
             a.checking_timeout = a.checking_timeout.max(Duration::from_secs(60));
         }
 

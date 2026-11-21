@@ -131,6 +131,7 @@ async fn authenticated_checks_compare_paths_and_nominate_once_after_deadline() -
                     local_id: local.id(),
                     destination: remote.addr(),
                     is_use_candidate: false,
+                    expanded_target: None,
                 });
         }
         let mut response = Message::new();

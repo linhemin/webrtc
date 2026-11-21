@@ -1,82 +1,136 @@
 use super::*;
 use std::net::SocketAddrV4;
 
-const CAPACITY: usize = 32;
-const WAVE: usize = 4;
-const BUDGET: Duration = Duration::from_secs(10);
-const QUERY_WINDOW: Duration = Duration::from_millis(1100);
+use super::super::agent_config::ExpandedUdpPool;
 
-// The address is supplied by the application from its signature-verified observer
-// list. The receiver must see the real socket before it can enter the cohort.
+const MAX_CAPACITY: usize = 500;
+const WAVE: usize = 24;
+const BUDGET: Duration = Duration::from_secs(20);
+const QUERY_WINDOW: Duration = Duration::from_millis(1100);
+const SOCKET_INTERVAL: Duration = Duration::from_millis(16);
+
 pub(super) async fn gather(
     params: &GatherCandidatesSrflxParams,
     sources: Vec<IpAddr>,
-    observer: SocketAddrV4,
+    pool: ExpandedUdpPool,
 ) {
-    if observer.port() == 0
-        || !globally_reachable_ipv4(*observer.ip())
-        || !params.network_types.contains(&NetworkType::Udp4)
-    {
+    if !params.network_types.contains(&NetworkType::Udp4) {
         return;
     }
+    let capacity = usize::from(pool.capacity).min(MAX_CAPACITY);
+    if capacity == 0 {
+        return;
+    }
+    let observers: Vec<_> = pool
+        .observers
+        .into_iter()
+        .take(4)
+        .filter(|addr| addr.port() != 0 && globally_reachable_ipv4(*addr.ip()))
+        .collect();
     let end = Instant::now() + BUDGET;
-    let mut active = None;
-    let native_sources = sources.iter().filter_map(|source| match *source {
-        IpAddr::V4(ip)
-            if !ip.is_unspecified()
-                && params
-                    .interface_stun_provider
-                    .as_ref()
-                    .map_or(true, |p| p.supports_source(ip)) =>
+    let mut routes = Vec::new();
+    for observer in observers.iter().copied() {
+        for source in sources
+            .iter()
+            .copied()
+            .filter(|source| match *source {
+                IpAddr::V4(ip) => {
+                    !ip.is_unspecified()
+                        && params
+                            .interface_stun_provider
+                            .as_ref()
+                            .map_or(true, |p| p.supports_source(ip))
+                }
+                IpAddr::V6(_) => false,
+            })
+            .take(4)
         {
-            Some(ip)
-        }
-        _ => None,
-    });
-    for ip in native_sources.take(4).map(IpAddr::V4) {
-        let route = (ip, SocketAddr::V4(observer));
-        if gather_one(params, route, observer, end).await.is_ok() {
-            active = Some(route);
-            break;
+            routes.push((source, SocketAddr::V4(observer), observer));
         }
     }
+
+    #[allow(unused_mut)]
+    let mut active = discover(params, &routes, end).await;
     #[cfg(any(target_os = "ios", test))]
     if active.is_none()
         && params.interface_stun_provider.is_none()
         && params.network_types.contains(&NetworkType::Udp6)
     {
-        let translated =
-            tokio::time::timeout_at(end, params.dns64.stun_destinations(observer)).await;
-        if let Ok(targets) = translated {
-            'routes: for target in targets {
-                for ip in sources
-                    .iter()
-                    .copied()
-                    .filter(|ip| ip.is_ipv6() && !ip.is_unspecified())
-                    .take(4)
-                {
-                    let route = (ip, target);
-                    if gather_one(params, route, observer, end).await.is_ok() {
-                        active = Some(route);
-                        break 'routes;
+        routes.clear();
+        for observer in observers.iter().copied() {
+            let translated =
+                tokio::time::timeout_at(end, params.dns64.stun_destinations(observer)).await;
+            if let Ok(targets) = translated {
+                for target in targets {
+                    for source in sources
+                        .iter()
+                        .copied()
+                        .filter(|ip| ip.is_ipv6() && !ip.is_unspecified())
+                        .take(4)
+                    {
+                        routes.push((source, target, observer));
                     }
                 }
             }
         }
+        active = discover(params, &routes, end).await;
     }
-    let Some(route) = active else { return };
+
+    let Some(mut route) = active else { return };
     let mut allocated = 1;
-    while allocated < CAPACITY && Instant::now() < end {
-        let count = WAVE.min(CAPACITY - allocated);
-        let replies = futures_util::future::join_all(
-            (0..count).map(|_| gather_one(params, route, observer, end)),
-        )
+    let mut missed = 0;
+    while allocated < capacity && Instant::now() < end {
+        let count = WAVE.min(capacity - allocated);
+        let started = Instant::now();
+        let replies = futures_util::future::join_all((0..count).map(|slot| async move {
+            tokio::time::sleep_until(started + SOCKET_INTERVAL * slot as u32).await;
+            gather_one(params, (route.0, route.1), route.2, end).await
+        }))
         .await;
         allocated += count;
-        if replies.iter().all(Result::is_err) {
+        if replies
+            .iter()
+            .all(|reply| matches!(reply, Err(Error::ErrClosed)))
+        {
             break;
         }
+        if replies.iter().any(Result::is_ok) {
+            missed = 0;
+        } else {
+            missed += 1;
+            if missed == 2 {
+                // Keep the current local interface when switching the observation service.
+                if let Some(next) = routes
+                    .iter()
+                    .cycle()
+                    .skip_while(|r| **r != route)
+                    .skip(1)
+                    .take(routes.len())
+                    .find(|r| r.0 == route.0 && r.2 != route.2)
+                {
+                    route = *next;
+                }
+            }
+            if missed >= 4 {
+                break;
+            }
+        }
     }
+}
+
+async fn discover(
+    params: &GatherCandidatesSrflxParams,
+    routes: &[(IpAddr, SocketAddr, SocketAddrV4)],
+    end: Instant,
+) -> Option<(IpAddr, SocketAddr, SocketAddrV4)> {
+    for &(source, target, observer) in routes {
+        match gather_one(params, (source, target), observer, end).await {
+            Ok(()) => return Some((source, target, observer)),
+            Err(Error::ErrClosed) => return None,
+            Err(_) => {}
+        }
+    }
+    None
 }
 
 async fn gather_one(

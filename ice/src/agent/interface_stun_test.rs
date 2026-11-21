@@ -266,7 +266,11 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
         endpoint: observer,
         requests: Mutex::new(Vec::new()),
     });
-    for (physical, corrupt, expected) in [(false, false, 32), (true, false, 32), (true, true, 0)] {
+    for (physical, corrupt, capacity, expected) in [
+        (false, false, 32, 32),
+        (true, false, 500, 500),
+        (true, true, 32, 0),
+    ] {
         let (tx, mut reads) = mpsc::channel(40);
         let task = tokio::spawn(serve(peer_socket.clone(), mapped, corrupt, tx));
         let agent = Agent::new(AgentConfig {
@@ -275,7 +279,7 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
             candidate_types: vec![CandidateType::Host, CandidateType::ServerReflexive],
             multicast_dns_mode: MulticastDnsMode::Disabled,
             gather_interface_srflx: true,
-            expanded_udp_observer: Some(observer),
+            expanded_udp_pool: Some(super::super::agent_config::ExpandedUdpPool { observers: vec![observer], capacity }),
             interface_stun_provider: physical
                 .then(|| provider.clone() as Arc<dyn InterfaceStunProvider>),
             ..Default::default()
@@ -291,7 +295,7 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
             })
         }));
         agent.gather_candidates()?;
-        tokio::time::timeout(Duration::from_secs(12), gathered.recv())
+        tokio::time::timeout(Duration::from_secs(20), gathered.recv())
             .await
             .unwrap()
             .unwrap();
@@ -318,7 +322,7 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
         }
         let request_count = provider.requests.lock().await.len();
         if physical {
-            assert_eq!(request_count, if corrupt { 1 } else { 32 });
+            assert_eq!(request_count, if corrupt { 1 } else { expected });
         } else {
             assert_eq!(request_count, 0);
         }
@@ -334,7 +338,7 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
         candidate_types: vec![CandidateType::Host, CandidateType::ServerReflexive],
         multicast_dns_mode: MulticastDnsMode::Disabled,
         gather_interface_srflx: true,
-        expanded_udp_observer: Some(observer),
+        expanded_udp_pool: Some(super::super::agent_config::ExpandedUdpPool { observers: vec![observer], capacity: 32 }),
         ..Default::default()
     })
     .await?;

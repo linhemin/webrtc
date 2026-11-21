@@ -49,7 +49,7 @@ pub struct Candidates {
     pub ip_filter: Arc<Option<IpFilterFn>>,
     pub gather_interface_srflx: bool,
     pub grouped_physical_stun: bool,
-    pub expanded_udp_observer: Option<std::net::SocketAddrV4>,
+    pub expanded_udp_pool: Option<ice::agent::agent_config::ExpandedUdpPool>,
     pub interface_stun_provider: Option<Arc<dyn InterfaceStunProvider>>,
     pub nat_1to1_ips: Vec<String>,
     pub nat_1to1_ip_candidate_type: RTCIceCandidateType,
@@ -203,9 +203,14 @@ impl SettingEngine {
         self.candidates.interface_filter = Arc::new(Some(filter));
     }
 
-    /// Allocate fresh local ports for a negotiated full retry using this verified observer.
-    pub fn set_expanded_udp_pool(&mut self, signed_observer: std::net::SocketAddrV4) {
-        self.candidates.expanded_udp_observer = Some(signed_observer);
+    /// Allocate fresh local ports using application-verified observers.
+    pub fn set_expanded_udp_pool(
+        &mut self,
+        observers: Vec<std::net::SocketAddrV4>,
+        capacity: u16,
+    ) {
+        self.candidates.expanded_udp_pool =
+            Some(ice::agent::agent_config::ExpandedUdpPool { observers, capacity });
     }
 
     pub fn set_grouped_physical_stun(&mut self, enabled: bool) {
