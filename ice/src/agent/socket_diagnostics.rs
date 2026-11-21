@@ -50,6 +50,7 @@ counters! {
     gather_reads, gather_binding_requests, gather_matched_responses,
     seed_ipv4, seed_nat64, seed_bind_failed, seed_sent, seed_send_failed,
     seed_timeout, seed_invalid_reply, seed_mapping_rejected, seed_verified,
+    magic_requests, magic_verified,
     nat64_source_drops, nat64_binding_request_drops,
 }
 

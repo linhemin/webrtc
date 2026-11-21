@@ -1005,6 +1005,9 @@ impl AgentInternal {
                         && request.local_id == local.id()
                 }).and_then(|request| request.expanded_target.clone());
                 if let Some(target) = target {
+                    if wrapped {
+                        self.socket_rx.direct(local, |c| &c.magic_verified);
+                    }
                     let candidate = match remote_candidate {
                         Some(candidate) => candidate,
                         None => {
@@ -1072,6 +1075,7 @@ impl AgentInternal {
                 if !has_punch_magic(m) {
                     return;
                 }
+                self.socket_rx.direct(local, |c| &c.magic_requests);
                 if let Some(candidate) = &remote_candidate {
                     let pair = CandidatePair::new(local.clone(), candidate.clone(),
                         self.is_controlling.load(Ordering::SeqCst));
@@ -1356,7 +1360,7 @@ impl AgentInternal {
                 && stun::message::is_message(payload)
             {
                 let mut message = Message { raw: payload.to_vec(), ..Default::default() };
-                if message.decode().is_ok() {
+                if message.decode().is_ok() && matches!(message.typ, BINDING_REQUEST | BINDING_SUCCESS) {
                     self.handle_inbound_on_wire(&mut message, c, src_addr, true).await;
                 }
             }
