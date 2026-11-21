@@ -84,9 +84,24 @@ pub(crate) async fn observed_mapping(
     deadline: Duration,
     socket_rx: &SocketCounters,
 ) -> Result<(XorMappedAddress, bool, Message)> {
-    let (response, matched) = stun_exchange(conn, server_addr, deadline, Some(socket_rx)).await?;
+    let (response, matched) = stun_exchange(conn, server_addr, deadline, Some(socket_rx), false).await?;
     let mut mapped = XorMappedAddress::default();
     mapped.get_from(&response)?;
+    Ok((mapped, matched, response))
+}
+
+pub(crate) async fn observe_pool_route(
+    conn: &Arc<dyn Conn + Send + Sync>,
+    server_addr: SocketAddr,
+    deadline: Duration,
+    socket_rx: &SocketCounters,
+) -> Result<(XorMappedAddress, bool, Message)> {
+    let (response, matched) = stun_exchange(conn, server_addr, deadline, Some(socket_rx), true).await?;
+    let mut mapped = XorMappedAddress::default();
+    mapped.get_from(&response).map_err(|err| {
+        socket_rx.add(|c| &c.seed_invalid_reply);
+        err
+    })?;
     Ok((mapped, matched, response))
 }
 
@@ -97,7 +112,7 @@ pub async fn stun_request(
     server_addr: SocketAddr,
     deadline: Duration,
 ) -> Result<Message> {
-    Ok(stun_exchange(conn, server_addr, deadline, None).await?.0)
+    Ok(stun_exchange(conn, server_addr, deadline, None, false).await?.0)
 }
 
 async fn stun_exchange(
@@ -105,14 +120,38 @@ async fn stun_exchange(
     server_addr: SocketAddr,
     deadline: Duration,
     socket_rx: Option<&SocketCounters>,
+    retry_if_silent: bool,
 ) -> Result<(Message, bool)> {
     let mut request = Message::new();
     request.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
     request.add(stun::attributes::ATTR_SOFTWARE, b"RustDesk observation");
 
-    conn.send_to(&request.raw, server_addr).await?;
+    let send = || async {
+        let sent = conn.send_to(&request.raw, server_addr).await;
+        if retry_if_silent {
+            if let Some(counters) = socket_rx {
+                counters.add(|c| if sent.is_ok() { &c.seed_sent } else { &c.seed_send_failed });
+            }
+        }
+        sent
+    };
+    send().await?;
     let mut bs = vec![0_u8; MAX_MESSAGE_SIZE];
-    let (n, source) = if deadline > Duration::from_secs(0) {
+    let first = if retry_if_silent {
+        match tokio::time::timeout(Duration::from_millis(250), conn.recv_from(&mut bs)).await {
+            Ok(packet) => Some(packet?),
+            Err(_) => {
+                // Losing the seed request otherwise prevents the entire pool from opening.
+                send().await?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (n, source) = if let Some(packet) = first {
+        packet
+    } else if deadline > Duration::from_secs(0) {
         match tokio::time::timeout(deadline, conn.recv_from(&mut bs)).await {
             Ok(result) => match result {
                 Ok((n, addr)) => (n, addr),
@@ -129,7 +168,14 @@ async fn stun_exchange(
     }
     let mut res = Message::new();
     res.raw = bs[..n].to_vec();
-    res.decode()?;
+    res.decode().map_err(|err| {
+        if retry_if_silent {
+            if let Some(counters) = socket_rx {
+                counters.add(|c| &c.seed_invalid_reply);
+            }
+        }
+        err
+    })?;
 
     let matched = source == server_addr
         && res.typ == BINDING_SUCCESS
@@ -137,6 +183,10 @@ async fn stun_exchange(
     if matched {
         if let Some(rx) = socket_rx {
             rx.add(|c| &c.gather_matched_responses);
+        }
+    } else if retry_if_silent {
+        if let Some(rx) = socket_rx {
+            rx.add(|c| &c.seed_invalid_reply);
         }
     }
     Ok((res, matched))

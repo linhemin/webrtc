@@ -21,7 +21,7 @@ use crate::use_candidate::*;
 trait ControllingSelector {
     async fn start(&self);
     async fn contact_candidates(&self);
-    async fn ping_candidate(&self, pair: &CandidatePair);
+    async fn ping_candidate(&self, pair: &CandidatePair, wrapped: bool);
     async fn handle_success_response(
         &self,
         m: &Message,
@@ -41,7 +41,7 @@ trait ControllingSelector {
 trait ControlledSelector {
     async fn start(&self);
     async fn contact_candidates(&self);
-    async fn ping_candidate(&self, pair: &CandidatePair);
+    async fn ping_candidate(&self, pair: &CandidatePair, wrapped: bool);
     async fn handle_success_response(
         &self,
         m: &Message,
@@ -249,10 +249,14 @@ impl AgentInternal {
     }
 
     pub(crate) async fn ping_candidate(&self, pair: &CandidatePair) {
+        self.ping_candidate_on_wire(pair, false).await;
+    }
+
+    pub(crate) async fn ping_candidate_on_wire(&self, pair: &CandidatePair, wrapped: bool) {
         if self.is_controlling.load(Ordering::SeqCst) {
-            ControllingSelector::ping_candidate(self, pair).await;
+            ControllingSelector::ping_candidate(self, pair, wrapped).await;
         } else {
-            ControlledSelector::ping_candidate(self, pair).await;
+            ControlledSelector::ping_candidate(self, pair, wrapped).await;
         }
     }
 
@@ -319,7 +323,7 @@ impl ControllingSelector for AgentInternal {
         }
     }
 
-    async fn ping_candidate(&self, pair: &CandidatePair) {
+    async fn ping_candidate(&self, pair: &CandidatePair, wrapped: bool) {
         let (msg, result) = {
             let ufrag_pwd = self.ufrag_pwd.lock().await;
             let username = ufrag_pwd.remote_ufrag.clone() + ":" + ufrag_pwd.local_ufrag.as_str();
@@ -330,6 +334,7 @@ impl ControllingSelector for AgentInternal {
                 Box::new(Username::new(ATTR_USERNAME, username)),
                 Box::new(AttrControlling(self.tie_breaker.load(Ordering::SeqCst))),
                 Box::new(PriorityAttr(pair.local.priority())),
+                Box::new(PunchMagic(wrapped || self.mapping_probes.is_expanded(&pair.local))),
                 Box::new(MessageIntegrity::new_short_term_integrity(
                     ufrag_pwd.remote_pwd.clone(),
                 )),
@@ -341,7 +346,7 @@ impl ControllingSelector for AgentInternal {
         if let Err(err) = result {
             log::error!("{}", err);
         } else {
-            self.send_binding_request(&msg, pair).await;
+            self.send_binding_request_on_wire(&msg, pair, wrapped).await;
         }
     }
 
@@ -448,7 +453,7 @@ impl ControlledSelector for AgentInternal {
         }
     }
 
-    async fn ping_candidate(&self, pair: &CandidatePair) {
+    async fn ping_candidate(&self, pair: &CandidatePair, wrapped: bool) {
         let (msg, result) = {
             let ufrag_pwd = self.ufrag_pwd.lock().await;
             let username = ufrag_pwd.remote_ufrag.clone() + ":" + ufrag_pwd.local_ufrag.as_str();
@@ -459,6 +464,7 @@ impl ControlledSelector for AgentInternal {
                 Box::new(Username::new(ATTR_USERNAME, username)),
                 Box::new(AttrControlled(self.tie_breaker.load(Ordering::SeqCst))),
                 Box::new(PriorityAttr(pair.local.priority())),
+                Box::new(PunchMagic(wrapped || self.mapping_probes.is_expanded(&pair.local))),
                 Box::new(MessageIntegrity::new_short_term_integrity(
                     ufrag_pwd.remote_pwd.clone(),
                 )),
@@ -470,7 +476,7 @@ impl ControlledSelector for AgentInternal {
         if let Err(err) = result {
             log::error!("{}", err);
         } else {
-            self.send_binding_request(&msg, pair).await;
+            self.send_binding_request_on_wire(&msg, pair, wrapped).await;
         }
     }
 

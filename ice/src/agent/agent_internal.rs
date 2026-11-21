@@ -12,6 +12,26 @@ use crate::util::*;
 pub type ChanCandidateTx =
     Arc<Mutex<Option<mpsc::Sender<Option<Arc<dyn Candidate + Send + Sync>>>>>>;
 
+const PUNCH_MAGIC: &[u8] = b"RD-PUNCH-1";
+const PUNCH_PREFIX: &[u8] = b"RDPU\x01";
+
+pub(crate) struct PunchMagic(pub bool);
+
+impl stun::message::Setter for PunchMagic {
+    fn add_to(&self, message: &mut Message) -> std::result::Result<(), stun::Error> {
+        if self.0 {
+            message.add(ATTR_SOFTWARE, PUNCH_MAGIC);
+        }
+        Ok(())
+    }
+}
+
+fn has_punch_magic(message: &Message) -> bool {
+    message.attributes.0.iter()
+        .take_while(|attr| attr.typ != ATTR_MESSAGE_INTEGRITY)
+        .any(|attr| attr.typ == ATTR_SOFTWARE && attr.value == PUNCH_MAGIC)
+}
+
 #[derive(Default)]
 pub(crate) struct UfragPwd {
     pub(crate) local_ufrag: String,
@@ -540,6 +560,48 @@ impl AgentInternal {
         true
     }
 
+    async fn verify_new_punch_address(
+        &self,
+        message: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: &Arc<dyn Candidate + Send + Sync>,
+        wrapped: bool,
+    ) {
+        let address = remote.addr();
+        if !matches!(address, SocketAddr::V4(addr) if addr.port() != 0 && globally_reachable_ipv4(*addr.ip())) {
+            return;
+        }
+        let offered_ip = self.remote_candidates.lock().await
+            .get(&local.network_type())
+            .is_some_and(|candidates| candidates.iter().any(|c| c.addr().ip() == address.ip()));
+        self.invalidate_pending_binding_requests(Instant::now()).await;
+        let (known_ip, already_checking, outstanding) = {
+            let pending = self.pending_binding_requests.lock().await;
+            (
+                offered_ip || pending.iter().any(|request| request.expanded_target.is_some()
+                    && request.destination.ip() == address.ip()),
+                pending.iter().any(|request| request.local_id == local.id()
+                    && request.destination == address),
+                pending.iter().filter(|request| request.expanded_target.as_ref()
+                    .is_some_and(|candidate| candidate.candidate_type() == CandidateType::PeerReflexive)).count(),
+            )
+        };
+        if !known_ip {
+            return;
+        }
+        let pair = CandidatePair::new(
+            local.clone(),
+            remote.clone(),
+            self.is_controlling.load(Ordering::SeqCst),
+        );
+        self.send_binding_success_on_wire(message, &pair, wrapped).await;
+        if !already_checking && outstanding < 64 && self.agent_conn.get_selected_pair().is_none() {
+            // A matching Binding Success promotes the provisional address through the normal
+            // expanded transaction lookup. The incoming request alone never nominates it.
+            self.ping_candidate_on_wire(&pair, true).await;
+        }
+    }
+
     pub(crate) async fn add_remote_candidate(&self, c: &Arc<dyn Candidate + Send + Sync>) {
         if !self.remember_remote_candidate(c).await {
             return;
@@ -729,6 +791,10 @@ impl AgentInternal {
     }
 
     pub(crate) async fn send_binding_request(&self, m: &Message, pair: &CandidatePair) {
+        self.send_binding_request_on_wire(m, pair, false).await;
+    }
+
+    pub(crate) async fn send_binding_request_on_wire(&self, m: &Message, pair: &CandidatePair, wrapped: bool) {
         let local = &pair.local;
         let remote = &pair.remote;
         log::trace!(
@@ -748,15 +814,19 @@ impl AgentInternal {
                 local_id: local.id(),
                 destination: remote.addr(),
                 is_use_candidate: m.contains(ATTR_USE_CANDIDATE),
-                expanded_target: self.mapping_probes.is_expanded(local).then(|| remote.clone()),
+                expanded_target: (wrapped || self.mapping_probes.is_expanded(local)).then(|| remote.clone()),
             });
         }
 
-        let sent = self.send_stun(m, local, remote).await;
+        let sent = self.send_stun_on_wire(m, local, remote, wrapped).await;
         pair.check_io.lock().record_sent_request(sent);
     }
 
     pub(crate) async fn send_binding_success(&self, m: &Message, pair: &CandidatePair) {
+        self.send_binding_success_on_wire(m, pair, false).await;
+    }
+
+    async fn send_binding_success_on_wire(&self, m: &Message, pair: &CandidatePair, wrapped: bool) {
         let local = &pair.local;
         let remote = &pair.remote;
         let addr = remote.addr();
@@ -787,7 +857,7 @@ impl AgentInternal {
                 err
             );
         } else {
-            let sent = self.send_stun(&out, local, remote).await;
+            let sent = self.send_stun_on_wire(&out, local, remote, wrapped).await;
             pair.check_io.lock().record_sent_response(sent);
             self.socket_rx.direct(local, |stats| {
                 if sent {
@@ -855,6 +925,16 @@ impl AgentInternal {
         local: &Arc<dyn Candidate + Send + Sync>,
         remote: SocketAddr,
     ) {
+        self.handle_inbound_on_wire(m, local, remote, false).await;
+    }
+
+    async fn handle_inbound_on_wire(
+        &self,
+        m: &mut Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: SocketAddr,
+        wrapped: bool,
+    ) {
         self.socket_rx.decoded(local, m.typ);
         if m.typ.method != METHOD_BINDING
             || !(m.typ.class == CLASS_SUCCESS_RESPONSE
@@ -917,7 +997,7 @@ impl AgentInternal {
                 }
             }
 
-            if self.mapping_probes.is_expanded(local) {
+            if wrapped || self.mapping_probes.is_expanded(local) {
                 self.invalidate_pending_binding_requests(Instant::now()).await;
                 let target = self.pending_binding_requests.lock().await.iter().find(|request| {
                     request.transaction_id == m.transaction_id
@@ -938,6 +1018,8 @@ impl AgentInternal {
                         self.add_pair(local.clone(), candidate.clone()).await;
                     }
                     remote_candidate = Some(candidate);
+                } else if wrapped {
+                    return;
                 }
             }
             if let Some(rc) = &remote_candidate {
@@ -986,6 +1068,17 @@ impl AgentInternal {
                 }
             }
 
+            if wrapped {
+                if !has_punch_magic(m) {
+                    return;
+                }
+                if let Some(candidate) = &remote_candidate {
+                    let pair = CandidatePair::new(local.clone(), candidate.clone(),
+                        self.is_controlling.load(Ordering::SeqCst));
+                    self.send_binding_success_on_wire(m, &pair, true).await;
+                    return;
+                }
+            }
             if remote_candidate.is_none() {
                 let mut priority = crate::priority::PriorityAttr::default();
                 let _ = priority.get_from(m);
@@ -1022,6 +1115,10 @@ impl AgentInternal {
                     remote
                 );
                 if let Some(rc) = &remote_candidate {
+                    if wrapped || (self.mapping_probes.is_expanded(local) && has_punch_magic(m)) {
+                        self.verify_new_punch_address(m, local, rc, wrapped).await;
+                        return;
+                    }
                     // RFC 8445 7.3.1.3-4: pair this learned address with the exact socket
                     // that accepted the authenticated request. The selector creates that pair.
                     self.remember_remote_candidate(rc).await;
@@ -1084,8 +1181,25 @@ impl AgentInternal {
         local: &Arc<dyn Candidate + Send + Sync>,
         remote: &Arc<dyn Candidate + Send + Sync>,
     ) -> bool {
-        match local.write_to(&msg.raw, &**remote).await {
-            Ok(n) => n == msg.raw.len(),
+        self.send_stun_on_wire(msg, local, remote, false).await
+    }
+
+    async fn send_stun_on_wire(
+        &self,
+        msg: &Message,
+        local: &Arc<dyn Candidate + Send + Sync>,
+        remote: &Arc<dyn Candidate + Send + Sync>,
+        wrapped: bool,
+    ) -> bool {
+        let packet;
+        let payload = if wrapped {
+            packet = [PUNCH_PREFIX, msg.raw.as_slice()].concat();
+            packet.as_slice()
+        } else {
+            msg.raw.as_slice()
+        };
+        match local.write_to(payload, &**remote).await {
+            Ok(n) => n == payload.len(),
             Err(err) => {
                 log::trace!(
                     "[{}]: failed to send STUN message: {}",
@@ -1236,6 +1350,18 @@ impl AgentInternal {
         src_addr: SocketAddr,
         addr: SocketAddr,
     ) {
+        if let Some(payload) = buf.strip_prefix(PUNCH_PREFIX) {
+            if c.network_type() == NetworkType::Udp4
+                && c.candidate_type() != CandidateType::Relay
+                && stun::message::is_message(payload)
+            {
+                let mut message = Message { raw: payload.to_vec(), ..Default::default() };
+                if message.decode().is_ok() {
+                    self.handle_inbound_on_wire(&mut message, c, src_addr, true).await;
+                }
+            }
+            return;
+        }
         if stun::message::is_message(buf) {
             let mut m = Message {
                 raw: vec![],

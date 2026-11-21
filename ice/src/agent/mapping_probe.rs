@@ -378,8 +378,13 @@ async fn sample(probes: &Probes, socket: &Local, endpoints: &[SocketAddr], order
             .map(|(target, _)| target.ip())
             .collect::<HashSet<_>>()
             .len() >= 2;
+        let networks = live.iter()
+            .map(|(target, _)| target.ip())
+            .collect::<HashSet<_>>();
         let series: Vec<_> = live.into_iter().map(|(_, mapped)| mapped).collect();
+        // Two ports on one STUN IP cannot distinguish EIM from address-dependent mapping.
         let profile = observed_profile(&series);
+        let profile = if profile == 0 && networks.len() < 2 { 3 } else { profile };
         result.ordered_profile = Some(profile);
         if profile == 1 {
             result.linear_step = Some(series[1].port().wrapping_sub(series[0].port()));
@@ -758,11 +763,14 @@ impl Agent {
             if !out.contains(&ep) {
                 out.push(ep);
             }
-            if !self.grouped_physical_stun && out.len() == MAX_OBSERVERS {
-                break;
-            }
         }
-        out
+        let mut distinct_ips = HashSet::new();
+        let (mut distinct, same_address): (Vec<_>, Vec<_>) =
+            out.into_iter().partition(|endpoint| distinct_ips.insert(endpoint.ip()));
+        distinct.extend(same_address);
+        let limit = if self.grouped_physical_stun { MAX_OBSERVER_URLS } else { MAX_OBSERVERS };
+        distinct.truncate(limit);
+        distinct
     }
 
     /// Coalesces with ordinary candidate/gather triggers. Uses the selector, credentials,

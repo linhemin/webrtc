@@ -2,6 +2,94 @@ use super::*;
 use crate::agent::agent_vnet_test::{connect_net2router, start_router};
 use util::vnet::router::{Router, RouterConfig};
 
+#[tokio::test]
+async fn expanded_pool_depends_on_which_nat64_sources_are_probed() -> Result<()> {
+    let router = Arc::new(Mutex::new(Router::new(RouterConfig {
+        cidr: "::/0".into(),
+        ..Default::default()
+    })?));
+    let mut sources: Vec<IpAddr> = (1..=5)
+        .map(|id| format!("2001:db8::{id}").parse().unwrap())
+        .collect();
+    let reachable = sources[4];
+    let destination: SocketAddr = "[64:ff9b::101:101]:3478".parse()?;
+    let observer = "1.1.1.1:3478".parse()?;
+    let client = Arc::new(Net::new(Some(NetConfig {
+        static_ips: sources.iter().map(ToString::to_string).collect(),
+        ..Default::default()
+    })));
+    let server = Arc::new(Net::new(Some(NetConfig {
+        static_ips: vec![destination.ip().to_string()],
+        ..Default::default()
+    })));
+    connect_net2router(&client, &router).await?;
+    connect_net2router(&server, &router).await?;
+    start_router(&router).await?;
+    let socket = server.bind(destination).await?;
+    let responder = tokio::spawn(async move {
+        let mut packet = [0; 1200];
+        while let Ok((n, source)) = socket.recv_from(&mut packet).await {
+            if source.ip() != reachable {
+                continue;
+            }
+            let mut request = Message::new();
+            request.raw = packet[..n].to_vec();
+            request.decode().unwrap();
+            let mut reply = Message::new();
+            reply
+                .build(&[
+                    Box::new(BINDING_SUCCESS),
+                    Box::new(request.transaction_id),
+                    Box::new(XorMappedAddress {
+                        ip: "9.9.9.9".parse().unwrap(),
+                        port: source.port(),
+                    }),
+                ])
+                .unwrap();
+            socket.send_to(&reply.raw, source).await.unwrap();
+        }
+    });
+    for order in [5, 1] {
+        let agent = Agent::new(AgentConfig {
+            net: Some(client.clone()),
+            ..Default::default()
+        }).await?;
+        let params = GatherCandidatesSrflxParams {
+            interface_stun_provider: None,
+            urls: Vec::new(),
+            network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
+            port_min: 49152,
+            port_max: 50000,
+            net: client.clone(),
+            agent_internal: agent.internal.clone(),
+            dns64: crate::nat64::Discovery::with_test_prefix(),
+            supplement: Some(Nat64Gather::new(false)),
+        };
+        let start = Instant::now();
+        expanded_udp_pool::gather(
+            &params,
+            sources.clone(),
+            crate::agent::agent_config::ExpandedUdpPool {
+                observers: vec![observer],
+                capacity: 4,
+            },
+        ).await;
+        let count = agent.expanded_udp_candidates().await.len();
+        println!(
+            "NAT64 source #{}, expanded candidates {count}, {} ms",
+            order,
+            start.elapsed().as_millis()
+        );
+        assert_eq!(count, 4);
+        agent.close().await?;
+        sources.rotate_right(1);
+    }
+    responder.abort();
+    let _ = responder.await;
+    router.lock().await.stop().await?;
+    Ok(())
+}
+
 async fn answer(socket: &Arc<dyn Conn + Send + Sync>, mapped: IpAddr) -> Result<SocketAddr> {
     let mut packet = [0; 1200];
     let (n, source) = socket.recv_from(&mut packet).await?;

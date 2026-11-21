@@ -48,6 +48,8 @@ counters! {
     resp_role_conflict, resp_integrity_missing, resp_integrity_invalid, resp_unknown_remote,
     resp_unknown_transaction, resp_wrong_endpoint, resp_no_pair, resp_accepted,
     gather_reads, gather_binding_requests, gather_matched_responses,
+    seed_ipv4, seed_nat64, seed_bind_failed, seed_sent, seed_send_failed,
+    seed_timeout, seed_invalid_reply, seed_mapping_rejected, seed_verified,
     nat64_source_drops, nat64_binding_request_drops,
 }
 

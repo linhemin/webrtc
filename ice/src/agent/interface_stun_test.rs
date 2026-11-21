@@ -38,9 +38,12 @@ async fn serve(
     socket: Arc<dyn Conn + Send + Sync>,
     mapped_ip: IpAddr,
     corrupt: bool,
+    drop_first: bool,
     data: mpsc::Sender<SocketAddr>,
 ) {
     let mut buf = [0u8; 1200];
+    let mut dropped = None;
+    let mut recovered = !drop_first;
     while let Ok((n, src)) = socket.recv_from(&mut buf).await {
         if &buf[..n] == b"selected-pair data" {
             let _ = data.send(src).await;
@@ -52,6 +55,16 @@ async fn serve(
         if message.contains(ATTR_USERNAME) && message.contains(ATTR_MESSAGE_INTEGRITY) {
             let _ = data.send(src).await;
             continue;
+        }
+        if !recovered {
+            let request = (src, message.transaction_id);
+            if let Some(first) = dropped {
+                assert_eq!(request, first, "the retry must use the original socket and transaction");
+                recovered = true;
+            } else {
+                dropped = Some(request);
+                continue;
+            }
         }
         let tx = if corrupt {
             TransactionId::new()
@@ -107,6 +120,7 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
         server.bind("10.0.0.10:3478".parse()?).await?,
         system_ip,
         false,
+        false,
         tx.clone(),
     ));
     for (enabled, grouped, corrupt, mode, relay_only, expect_calls) in [
@@ -118,7 +132,7 @@ async fn interface_stun_keeps_the_verified_socket_and_preserves_the_system_path(
         (true, true, false, MulticastDnsMode::Disabled, true, 0),
     ] {
         let socket = server.bind(physical.into()).await?;
-        let physical_stun = tokio::spawn(serve(socket.clone(), mapped, corrupt, tx.clone()));
+        let physical_stun = tokio::spawn(serve(socket.clone(), mapped, corrupt, false, tx.clone()));
         let provider = Arc::new(AdapterStun {
             net: local.clone(),
             endpoint: physical,
@@ -266,13 +280,14 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
         endpoint: observer,
         requests: Mutex::new(Vec::new()),
     });
-    for (physical, corrupt, capacity, expected) in [
-        (false, false, 32, 32),
-        (true, false, 500, 500),
-        (true, true, 32, 0),
+    for (physical, corrupt, drop_first, capacity, expected) in [
+        (false, false, false, 32, 32),
+        (true, false, false, 500, 500),
+        (true, true, false, 32, 0),
+        (false, false, true, 32, 32),
     ] {
         let (tx, mut reads) = mpsc::channel(40);
-        let task = tokio::spawn(serve(peer_socket.clone(), mapped, corrupt, tx));
+        let task = tokio::spawn(serve(peer_socket.clone(), mapped, corrupt, drop_first, tx));
         let agent = Agent::new(AgentConfig {
             net: Some(local.clone()),
             network_types: vec![NetworkType::Udp4],
@@ -300,7 +315,7 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
             .unwrap()
             .unwrap();
         let pool = agent.expanded_udp_candidates().await;
-        assert_eq!(pool.len(), expected);
+        assert_eq!(pool.len(), expected, "physical={physical} corrupt={corrupt} first observation dropped={drop_first}");
         assert_eq!(
             pool.iter()
                 .map(|(_, a)| a.port())
@@ -374,6 +389,112 @@ async fn expanded_pool_owns_distinct_checked_ports_on_native_and_physical_paths(
     // VNet keeps explicit reservations, so rebinding also verifies closure of the pending socket.
     local.bind(source).await?.close().await?;
     peer_socket.close().await?;
+    router.lock().await.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_punch_port_is_only_promoted_after_wrapped_round_trip() -> Result<()> {
+    use stun::{fingerprint::FINGERPRINT, integrity::MessageIntegrity, textattrs::Username};
+    let router = Arc::new(Mutex::new(Router::new(RouterConfig {
+        cidr: "0.0.0.0/0".into(),
+        ..Default::default()
+    })?));
+    let source = "10.0.0.20";
+    let observer: SocketAddrV4 = "8.8.4.4:21116".parse()?;
+    let client = Arc::new(Net::new(Some(NetConfig { static_ips: vec![source.into()], ..Default::default() })));
+    let server = Arc::new(Net::new(Some(NetConfig {
+        static_ips: vec![observer.ip().to_string()],
+        ..Default::default()
+    })));
+    for network in [&client, &server] {
+        connect_net2router(network, &router).await?;
+    }
+    start_router(&router).await?;
+    let (data, _) = mpsc::channel(1);
+    let observer_task = tokio::spawn(serve(server.bind(observer.into()).await?,
+        "9.9.9.9".parse()?, false, false, data));
+    let peer = server.bind(SocketAddr::new((*observer.ip()).into(), 0)).await?;
+    let wrong_port = server.bind(SocketAddr::new((*observer.ip()).into(), 0)).await?;
+    let agent = Agent::new(AgentConfig {
+        net: Some(client),
+        network_types: vec![NetworkType::Udp4],
+        candidate_types: vec![CandidateType::Host, CandidateType::ServerReflexive],
+        multicast_dns_mode: MulticastDnsMode::Disabled,
+        gather_interface_srflx: true,
+        expanded_udp_pool: Some(crate::agent::agent_config::ExpandedUdpPool {
+            observers: vec![observer], capacity: 1,
+        }),
+        ..Default::default()
+    }).await?;
+    let (local_ufrag, local_key) = agent.get_local_user_credentials().await;
+    let peer_key = "peer-signing-key";
+    agent.set_remote_credentials("peer".into(), peer_key.into()).await?;
+    let offered: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp4".into(), address: observer.ip().to_string(),
+                port: observer.port(), component: 1, ..Default::default()
+            },
+            ..Default::default()
+        }.new_candidate_host()?,
+    );
+    agent.add_remote_candidate(&offered)?;
+    agent.on_candidate(Box::new(|_| Box::pin(async {})));
+    agent.internal.started_ch_tx.lock().await.take();
+    agent.gather_candidates()?;
+    let mapped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some((_, endpoint)) = agent.expanded_udp_candidates().await.first() {
+                break *endpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    let local: SocketAddr = format!("{source}:{}", mapped.port()).parse()?;
+    let unknown = peer.local_addr()?;
+    let mut request = Message::new();
+    request.build(&[
+        Box::new(BINDING_REQUEST), Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, format!("{local_ufrag}:peer"))),
+        Box::new(crate::agent::agent_internal::PunchMagic(true)),
+        Box::new(MessageIntegrity::new_short_term_integrity(local_key)),
+        Box::new(FINGERPRINT),
+    ])?;
+    peer.send_to(&request.raw, local).await?;
+    let mut buffer = [0; 1200];
+    let prefix = b"RDPU\x01";
+    let challenge = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let (n, from) = peer.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(from, local);
+            if let Some(payload) = buffer[..n].strip_prefix(prefix) {
+                let mut challenge = Message { raw: payload.to_vec(), ..Default::default() };
+                challenge.decode().unwrap();
+                break challenge;
+            }
+        }
+    }).await.unwrap();
+    assert!(agent.internal.find_remote_candidate(NetworkType::Udp4, unknown).await.is_none());
+    let mut reply = Message::new();
+    reply.build(&[
+        Box::new(BINDING_SUCCESS), Box::new(challenge.transaction_id),
+        Box::new(XorMappedAddress { ip: local.ip(), port: local.port() }),
+        Box::new(MessageIntegrity::new_short_term_integrity(peer_key.into())),
+        Box::new(FINGERPRINT),
+    ])?;
+    let wire = [prefix.as_slice(), reply.raw.as_slice()].concat();
+    wrong_port.send_to(&wire, local).await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(agent.internal.find_remote_candidate(NetworkType::Udp4, unknown).await.is_none());
+    peer.send_to(&wire, local).await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while agent.internal.find_remote_candidate(NetworkType::Udp4, unknown).await.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    agent.close().await?;
+    observer_task.abort();
     router.lock().await.stop().await?;
     Ok(())
 }

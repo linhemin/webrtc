@@ -8,6 +8,10 @@ const WAVE: usize = 24;
 const BUDGET: Duration = Duration::from_secs(20);
 const QUERY_WINDOW: Duration = Duration::from_millis(1100);
 const SOCKET_INTERVAL: Duration = Duration::from_millis(16);
+#[cfg(any(target_os = "ios", test))]
+const NATIVE_DISCOVERY_BUDGET: Duration = Duration::from_secs(3);
+#[cfg(any(target_os = "ios", test))]
+const MAX_TRANSLATED_SOURCES: usize = 8;
 
 pub(super) async fn gather(
     params: &GatherCandidatesSrflxParams,
@@ -49,25 +53,39 @@ pub(super) async fn gather(
         }
     }
 
-    #[allow(unused_mut)]
-    let mut active = discover(params, &routes, end).await;
     #[cfg(any(target_os = "ios", test))]
-    if active.is_none()
-        && params.interface_stun_provider.is_none()
+    let translated_available = params.interface_stun_provider.is_none()
         && params.network_types.contains(&NetworkType::Udp6)
-    {
+        && sources.iter().any(IpAddr::is_ipv6);
+    #[cfg(any(target_os = "ios", test))]
+    let native_end = if translated_available { end.min(Instant::now() + NATIVE_DISCOVERY_BUDGET) } else { end };
+    #[cfg(not(any(target_os = "ios", test)))]
+    let native_end = end;
+    #[allow(unused_mut)]
+    let mut active = discover(params, &routes, native_end).await;
+    #[cfg(any(target_os = "ios", test))]
+    if active.is_none() && translated_available {
         routes.clear();
         for observer in observers.iter().copied() {
             let translated =
                 tokio::time::timeout_at(end, params.dns64.stun_destinations(observer)).await;
             if let Ok(targets) = translated {
                 for target in targets {
-                    for source in sources
+                    let mut eligible: Vec<_> = sources
                         .iter()
                         .copied()
                         .filter(|ip| ip.is_ipv6() && !ip.is_unspecified())
-                        .take(4)
-                    {
+                        .collect();
+                    if !params.net.is_virtual() {
+                        let preferred = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))
+                            .and_then(|socket| {
+                                socket.connect(target)?;
+                                socket.local_addr()
+                            })
+                            .ok().map(|local| local.ip());
+                        eligible.sort_by_key(|source| (Some(*source) != preferred, *source));
+                    }
+                    for source in eligible.into_iter().take(MAX_TRANSLATED_SOURCES) {
                         routes.push((source, target, observer));
                     }
                 }
@@ -84,7 +102,7 @@ pub(super) async fn gather(
         let started = Instant::now();
         let replies = futures_util::future::join_all((0..count).map(|slot| async move {
             tokio::time::sleep_until(started + SOCKET_INTERVAL * slot as u32).await;
-            gather_one(params, (route.0, route.1), route.2, end).await
+            gather_one(params, (route.0, route.1), route.2, end, ObservationMode::PoolWave).await
         }))
         .await;
         allocated += count;
@@ -124,10 +142,16 @@ async fn discover(
     end: Instant,
 ) -> Option<(IpAddr, SocketAddr, SocketAddrV4)> {
     for &(source, target, observer) in routes {
-        match gather_one(params, (source, target), observer, end).await {
-            Ok(()) => return Some((source, target, observer)),
+        match gather_one(params, (source, target), observer, end, ObservationMode::PoolDiscovery).await {
+            Ok(()) => {
+                log::trace!("expanded UDP discovery: IPv6={} verified", source.is_ipv6());
+                return Some((source, target, observer));
+            }
             Err(Error::ErrClosed) => return None,
-            Err(_) => {}
+            Err(_) => log::trace!(
+                "expanded UDP discovery: IPv6={} result={}",
+                source.is_ipv6(), if Instant::now() >= end { "budget expired" } else { "unverified" }
+            ),
         }
     }
     None
@@ -138,6 +162,7 @@ async fn gather_one(
     (source, target): (IpAddr, SocketAddr),
     observer: SocketAddrV4,
     end: Instant,
+    mode: ObservationMode,
 ) -> Result<()> {
     let deadline = end.min(Instant::now() + QUERY_WINDOW);
     if Instant::now() >= deadline
@@ -150,8 +175,14 @@ async fn gather_one(
     {
         return Err(Error::ErrClosed);
     }
+    let seed = matches!(mode, ObservationMode::PoolDiscovery);
+    let counters = &params.agent_internal.socket_rx;
+    if seed {
+        counters.add(|c| if target.is_ipv4() { &c.seed_ipv4 } else { &c.seed_nat64 });
+    }
     let host = observer.ip().to_string();
-    let conn = if let Some(provider) = &params.interface_stun_provider {
+    let bind = async {
+        let conn = if let Some(provider) = &params.interface_stun_provider {
         let IpAddr::V4(source) = source else {
             return Err(Error::ErrGetXorMappedAddrResponse);
         };
@@ -180,8 +211,8 @@ async fn gather_one(
             let _ = conn.close().await;
             return Err(Error::ErrGetXorMappedAddrResponse);
         }
-        conn
-    } else {
+            conn
+        } else {
         before(
             Some(deadline),
             listen_udp_in_port_range(
@@ -192,7 +223,15 @@ async fn gather_one(
             ),
         )
         .await?
+        };
+        Result::<_>::Ok(conn)
     };
-    Agent::install_observed_socket(params, conn, target, &host, Some(deadline), true, true).await?;
+    let conn = bind.await.map_err(|err| {
+        if seed {
+            counters.add(|c| &c.seed_bind_failed);
+        }
+        err
+    })?;
+    Agent::install_observed_socket(params, conn, target, &host, Some(deadline), true, mode).await?;
     Ok(())
 }

@@ -31,6 +31,13 @@ mod nat64_gather_test;
 #[path = "interface_stun_test.rs"]
 mod interface_stun_test;
 
+#[derive(Clone, Copy)]
+enum ObservationMode {
+    Regular,
+    PoolDiscovery,
+    PoolWave,
+}
+
 pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) udp_network: UDPNetwork,
     pub(crate) candidate_types: Vec<CandidateType>,
@@ -1023,7 +1030,16 @@ impl Agent {
         deadline: Option<Instant>,
         require_mapped_v4: bool,
     ) -> Result<Option<IpAddr>> {
-        Self::install_observed_socket(params, conn, remote, _host, deadline, require_mapped_v4, false).await
+        Self::install_observed_socket(
+            params,
+            conn,
+            remote,
+            _host,
+            deadline,
+            require_mapped_v4,
+            ObservationMode::Regular,
+        )
+        .await
     }
 
     async fn install_observed_socket(
@@ -1033,24 +1049,34 @@ impl Agent {
         _host: &str,
         deadline: Option<Instant>,
         require_mapped_v4: bool,
-        expanded: bool,
+        mode: ObservationMode,
     ) -> Result<Option<IpAddr>> {
+        let expanded = !matches!(mode, ObservationMode::Regular);
+        let seed = matches!(mode, ObservationMode::PoolDiscovery);
         let built = async {
-            let (mapped, matched, response) = before(
-                deadline,
-                observed_mapping(
-                    &conn,
-                    remote,
-                    STUN_GATHER_TIMEOUT,
-                    &params.agent_internal.socket_rx,
-                ),
-            )
-            .await?;
+            let counters = &params.agent_internal.socket_rx;
+            let outcome = async {
+                match mode {
+                    ObservationMode::PoolDiscovery => {
+                        observe_pool_route(&conn, remote, STUN_GATHER_TIMEOUT, counters).await
+                    }
+                    _ => observed_mapping(&conn, remote, STUN_GATHER_TIMEOUT, counters).await,
+                }
+            };
+            let (mapped, matched, response) = before(deadline, outcome).await.map_err(|err| {
+                if seed && deadline.is_some_and(|end| Instant::now() >= end) {
+                    counters.add(|c| &c.seed_timeout);
+                }
+                err
+            })?;
             let valid = matched
                 && mapped.port > 0
                 && !mapped.ip.is_unspecified()
                 && !mapped.ip.is_multicast();
             if expanded && !matches!(mapped.ip, IpAddr::V4(ip) if globally_reachable_ipv4(ip)) {
+                if seed && matched {
+                    counters.add(|c| &c.seed_mapping_rejected);
+                }
                 return Err(Error::ErrGetXorMappedAddrResponse);
             }
             if require_mapped_v4
@@ -1071,7 +1097,12 @@ impl Agent {
                     &params.agent_internal.socket_rx,
                 ),
             )
-            .await?;
+            .await.map_err(|err| {
+                if seed {
+                    counters.add(|c| &c.seed_mapping_rejected);
+                }
+                err
+            })?;
             #[cfg(not(any(target_os = "ios", test)))]
             let candidate_conn = Arc::clone(&conn);
             let local = conn.local_addr()?;
@@ -1130,6 +1161,9 @@ impl Agent {
         if let Err(err) = params.agent_internal.install_candidate(&candidate, !expanded).await {
             let _ = conn.close().await;
             return Err(err);
+        }
+        if seed {
+            params.agent_internal.socket_rx.add(|c| &c.seed_verified);
         }
         drop(open);
         if let Some(response) = response {
